@@ -1,0 +1,10 @@
+#Importing required libraries
+pandas 
+numpy 
+pdfplumber 
+PyMuPDF 
+notebook
+python-dotenv
+# DB driver for MySQL (used by `dataUtil.py` via SQLAlchemy)
+PyMySQL
+SQLAlchemy
