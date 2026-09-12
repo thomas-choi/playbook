@@ -36,9 +36,14 @@ doc was first written — commentary on top, trade table below, split at
 5. The market-commentary prose (Feature A, "Market Expectations for `<Month>`: ...") — **after**
    the trade table, not before it.
 
-**Split-point marker (confirmed, corrected):** split on the `"Copyright"` line instead —
-everything on physical page 2 before it (TOC + both `"Featured ... Suggestions"` sections) is fed
-to the trade-table parser (Feature B), everything after it is the commentary (Feature A). The
+**Split-point marker (confirmed, corrected twice):** the order above is what PyMuPDF emits
+for the *newer* issues (2025+). Older issues (e.g. `LCR Playbook 2022-11-21.pdf`) come out as
+TOC → commentary → trade table → `"Copyright"` as the very last line, so a plain "everything
+after `Copyright`" split yields empty commentary and leaks the prose into the trade parser.
+`_split_commentary()` therefore cuts the commentary out as the block from the line starting with
+`"Market Expectations"` up to the next `"Trade & Maintenance Suggestions"` / `"Copyright"` line
+(or end of page); the remaining lines are fed to the trade-table parser (Feature B). Only if no
+`"Market Expectations"` line exists does it fall back to the after-`"Copyright"` split. The
 existing `"Trade & Maintenance Suggestions"` marker is still useful and unchanged in role: it's
 what the trade-table parser's own pre-scan (cell 8 of `ETF_1_Code_v3_UBugfix2.ipynb`) uses to skip
 past the TOC boilerplate before parsing starts — generalized from the page-3-only
@@ -299,4 +304,102 @@ in `docs/TODOS.md`.
    `ETF_2_Code.ipynb` (commentary is saved to a local `.txt` next to the CSV), but the actual
    `POST /upload` call is still a no-op until `LLMWIKI_BASE_URL`/`LLMWIKI_API_TOKEN` exist and
    llmwiki's endpoint is reachable — the retry/skip (`MAX_LLMWIKI_RETRY`) function is written and
-   ready, just gated on `LLMWIKI_BASE_URL` being set.
+   ready, just gated on `LLMWIKI_BASE_URL` being set. **Update:** `playbook_etf.py` (step 6) now
+   makes the call for real via `POST /ingest {text, title}` — the `/upload` design above is
+   superseded; see "Batch script: `playbook_etf.py`" → "llmwiki".
+6. ✅ Batch script `playbook_etf.py` — folder scan of `*Playbook YYYY-MM-DD.pdf`, same parser as
+   `ETF_2_Code.ipynb`, DB append with skip-already-loaded-dates, llmwiki `/ingest` with the date
+   in title and body. Design in "Batch script: `playbook_etf.py`" at the end of this document.
+
+## Batch script: `playbook_etf.py`
+
+### Purpose
+
+`ETF_2_Code.ipynb` handles one PDF per hand-edited run (`InputDate` + filename in cell 3).
+`playbook_etf.py` is the script version of that notebook: point it at a folder and it processes
+every `*Playbook YYYY-MM-DD.pdf` it finds — same parser, same CSV/commentary side files, then the
+DB append and the llmwiki ingest — skipping dates that are already in the database. The notebook
+stays in the repo as the interactive/debug reference; the script is what a scheduled or catch-up
+run should call.
+
+### CLI
+
+```
+python playbook_etf.py FOLDER [--since YYYY-MM-DD] [--force] [--skip-db] [--skip-llmwiki]
+                              [--dry-run] [--env-file DB_Config.env] [--out-dir DIR]
+                              [--log-level INFO]
+```
+
+- `FOLDER` is scanned non-recursively for filenames matching
+  `Playbook[ -](\d{4}-\d{2}-\d{2})\.pdf$` (case-insensitive) — i.e. both the Google-Drive name
+  `912 Playbook 2026-09-07.pdf` and the repo sample `Playbook-2026-09-07.pdf`. The date is taken
+  from the filename; this replaces the notebook's hand-edited `InputDate`.
+- PDFs are processed oldest-first. `--since` drops anything dated before the given day.
+- `--dry-run` = `--skip-db --skip-llmwiki` (parse + write the CSV and `_commentary.txt` only).
+- `--out-dir` defaults to the PDF's own folder, matching the notebook (CSV and
+  `<stem>_commentary.txt` next to the PDF).
+- `--env-file` (default `DB_Config.env`) is passed to `load_dotenv()` before anything touches
+  `dataUtil`; a missing file is a warning, not an error, so the process environment can be used
+  instead (e.g. in a container).
+
+### Stage → function map (all ported from `ETF_2_Code.ipynb`)
+
+| Function | Notebook cell(s) | Notes |
+|---|---|---|
+| `find_playbook_pdfs(folder)` | 3 | new — folder scan + date from filename |
+| `extract_text(pdf)` → `(table_text, commentary_text)` | 4 | skip physical page 1; cut the `"Market Expectations"` block out of page 2 (fallback: after `"Copyright"`); warn if neither marker is found |
+| `parse_trades(table_text)` → `DataFrame` | 5, 7, 9 | **only structural change:** rows are accumulated as dicts and turned into a DataFrame once, instead of the notebook's pre-seeded DataFrame + chained assignment (`df['Col'][row] = v`), which pandas ≥ 2 no longer supports; the seed-row/`df[:-1]` dance goes away with it. Regexes, branch order, combo broadcast and the log-and-continue per-line `try/except` are unchanged. The section-header test is `find(...) >= 0` rather than the notebook's `> 0`. Raises if no `"Trade & Maintenance Suggestions"` header is found (the notebook would silently parse nothing). |
+| `derive_columns(df)` | 11, 14–17 | `Low`/`High`/`Low-High`, the three `*_Sign` columns, Stop back-fill from the next row, sign forward-fill within a Type/Symbol/Trend group — same sequential semantics via `df.at`. Cell 13 (computes `nstop` and discards it) is dropped as dead code. |
+| `finalize(df, date)` → `(csv_df, db_df)` | 18–21, 23–25 | `csv_df` is exactly what the notebook writes to CSV (strings, Investor rows then Trader rows); `db_df` is the typed frame the notebook got back from its CSV round-trip (`Date`/`Expiration` as datetimes, strikes/prices as floats, `quantity` as int). `Expiration` is parsed with an explicit `%m/%d/%y` / `%m/%d/%Y` format instead of inference. |
+| `upload_commentary(text, date)` | 27 | see "llmwiki" below |
+| `loaded_dates(db, table)` / `store(db_df, db, table)` | 29 | `DU.load_df_SQL` / `DU.StoreEOD` |
+| `process_pdf(...)`, `main()` | — | per-file driver + CLI |
+
+Validated by running the notebook's cells 5–21 verbatim and the script's functions on the same
+extracted text of `Playbook-2026-09-07.pdf`: both produce the identical 58-row frame (Boeing
+`[BA]` `quantity=-1`; Paypal `[PYPL]` two rows with `Entry=-0.75`, `Target=64.37`, `Stop=43.73`,
+`quantity=1/-2`; same pre-existing `Trader Trend [Bullish/Hold` warning on page 6).
+
+### Dedupe rule
+
+`DU.StoreEOD` is still a plain `to_sql(if_exists='append')` (the composite-PK/upsert migration in
+`docs/TODOS.md` hasn't landed), so the script guards against duplicates itself: at startup it runs
+`SELECT DISTINCT Date FROM {DBTRADING}.{TBLETFOPTIONS}` once and skips every PDF whose date is
+already present. `--force` disables the check (rows are then **appended**, not replaced — use it
+only after deleting the date's rows or once upsert exists). If the query fails the script logs a
+warning and skips nothing; with `--skip-db` the query isn't run at all.
+
+### llmwiki
+
+Feature A's earlier `/upload` (multipart `.txt`) design is superseded: the script calls
+`POST {LLMWIKI_BASE_URL}/ingest` with JSON `{"text": "Date: YYYY-MM-DD\n\n<commentary>",
+"title": "LCR Playbook Market Commentary YYYY-MM-DD"}` and `Authorization: Bearer
+{LLMWIKI_API_TOKEN}` (`docs/llm-wiki-technical-document.md` §6.2). The date is therefore carried
+in both the title and the first line of the body. llmwiki content-addresses `text` sources
+(`pipeline/ingest.py::_source_id`), so re-sending the same PDF's commentary is idempotent.
+Retry/skip policy is unchanged: up to `MAX_LLMWIKI_RETRY` attempts (short backoff between them),
+then log and move on — a llmwiki outage never fails the run. Unset `LLMWIKI_BASE_URL` → skipped
+with an info log. The commentary is always saved to `<stem>_commentary.txt` first, so a skipped
+upload can be replayed later.
+
+### Error policy
+
+- One PDF failing (unreadable file, no section header, etc.) is logged with a traceback and the
+  loop continues; the exit code is `1` if any file failed, `0` otherwise, `2` for a bad folder.
+- Per-line parse exceptions inside `parse_trades` are warnings, as in the notebook.
+- `StoreEOD` logs and swallows DB errors (existing `dataUtil.py` behaviour) — check the log for
+  `Exception occurred` if a date is unexpectedly missing from the table.
+
+### Configuration
+
+Read from the environment after `--env-file` is loaded (mirrored in `.env.example`):
+
+| Var | Default | Used for |
+|---|---|---|
+| `DBTRADING` | `Trading` | target database |
+| `TBLETFOPTIONS` | `ETF_Options_v1` | target table (the notebook's current table; has `quantity`) |
+| `LLMWIKI_BASE_URL` | unset → skip | llmwiki base URL |
+| `LLMWIKI_API_TOKEN` | `""` | bearer token |
+| `MAX_LLMWIKI_RETRY` | `5` | attempts per PDF |
+| `LLMWIKI_TIMEOUT` | `30` | seconds per request |
+| `DBHOST`/`DBPORT`/`DBUSER`/`DBPWD`/`DBMKTDATA` | — | consumed by `dataUtil.get_DBengine` |

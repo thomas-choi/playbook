@@ -8,5 +8,7 @@ python-dotenv
 # DB driver for MySQL (used by `dataUtil.py` via SQLAlchemy)
 PyMySQL
 SQLAlchemy
+# timezone handling in `dataUtil.py`
+pytz
 # HTTP client for the llmwiki /upload call (ETF_2_Code.ipynb, Feature A)
 requests

@@ -18,6 +18,9 @@ workflow, not a library.
   Investor vs. Trader trends) and writes rows to the `Trading.ETF_Options` table.
 - `Top20-Ubuntu.ipynb` — parses the "Top20" PDF (per-stock entry/target/stop levels) and writes
   rows to the `Trading.Stock_Options` table.
+- `playbook_etf.py` — CLI version of `ETF_2_Code.ipynb`: scans a folder of Playbook PDFs, loads
+  rows to `Trading.ETF_Options_v1` (skipping already-loaded dates) and sends the page-2 market
+  commentary to llmwiki.
 - `dataUtil.py` — `DU` module imported by both notebooks: builds the SQLAlchemy/PyMySQL engine
   from env vars, and provides `load_df`, `load_eod_price`, `load_symbols`, `StoreEOD`, etc. for
   reading/writing the market-data and options tables.
@@ -66,8 +69,12 @@ does not propagate to the other.
   a newer interpreter.
 - Install deps: `pip install -r requirements.txt` (pandas, numpy, pdfplumber, PyMuPDF, notebook,
   python-dotenv, PyMySQL, SQLAlchemy).
-- Run via Jupyter: `jupyter notebook` (or open in VS Code) and execute cells top-to-bottom; there
-  is no `.py` entry point or CLI for the pipeline.
+- Run via Jupyter: `jupyter notebook` (or open in VS Code) and execute cells top-to-bottom.
+- Batch/CLI alternative for the Playbook PDF: `python playbook_etf.py <folder> [--dry-run]`
+  processes every `*Playbook YYYY-MM-DD.pdf` in the folder with the same logic as
+  `ETF_2_Code.ipynb` (one function per notebook stage), skips dates already in
+  `Trading.ETF_Options_v1`, and posts the page-2 market commentary to llmwiki `/ingest`. Design
+  and options are in `docs/Design-Plan.md` → "Batch script". The Top20 notebook has no script yet.
 - Source PDFs are read from a Google-Drive path mounted in WSL (`/mnt/i/My Drive/...`) — that
   mount and the specific dated PDF filename must exist locally before the first cell will run.
 - DB config is loaded from `DB_Config.env` (via `load_dotenv`), not `.env`; `dataUtil.py` reads

@@ -5,6 +5,48 @@ repository, per the project's mandatory change-logging rule. Newest entries at t
 
 ---
 
+## 2026-09-11 — Add `playbook_etf.py` batch script (folder scan → DB → llmwiki)
+
+- **Goal:** Convert `ETF_2_Code.ipynb` into a re-runnable CLI that takes a folder, processes
+  every `*Playbook YYYY-MM-DD.pdf` in it, appends the rows to `Trading.ETF_Options_v1`, and
+  sends each PDF's page-2 market commentary to llmwiki with the date.
+- **Implementation detail:**
+  - `playbook_etf.py` (new) — one function per notebook stage (`extract_text`, `parse_trades`,
+    `derive_columns`, `finalize`, `upload_commentary`, `loaded_dates`/`store`, `process_pdf`,
+    `main`); the mapping to notebook cells is tabulated in `docs/Design-Plan.md` → "Batch script".
+    Parsing logic is unchanged except that rows are built as a list of dicts instead of pandas
+    chained assignment (pandas ≥ 2 compatibility; also removes the seed-row/`df[:-1]` trick), the
+    section-header test is `>= 0` rather than `> 0`, a missing header now raises instead of
+    silently parsing nothing, and `Expiration` is parsed with an explicit format. Dead cell 13
+    (`nstop` computed and discarded) was not ported. Dedupe: `SELECT DISTINCT Date` from the
+    target table at startup, skip loaded dates unless `--force`. llmwiki: `POST /ingest`
+    `{text: "Date: YYYY-MM-DD\n\n…", title: "LCR Playbook Market Commentary YYYY-MM-DD"}` with the
+    existing retry-then-skip policy (supersedes the notebook's multipart `/upload` stub). CLI
+    flags: `--since`, `--force`, `--skip-db`, `--skip-llmwiki`, `--dry-run`, `--env-file`,
+    `--out-dir`, `--log-level`. `import pymupdf as fitz` with a fallback to `import fitz` for
+    older PyMuPDF.
+  - `.env.example` — added `DBTRADING`, `TBLETFOPTIONS`, `LLMWIKI_TIMEOUT`.
+  - `docs/Design-Plan.md` — appended the "Batch script: `playbook_etf.py`" section (CLI, stage →
+    function map, dedupe rule, llmwiki payload, error policy, config); added Sequencing step 6 and
+    noted Feature A's `/upload` plan is superseded by `/ingest`.
+  - `docs/TODOS.md` — checked off Feature A; added a follow-up to run the script against the real
+    Google-Drive folder and schedule it.
+  - `CLAUDE.md` — listed the script in the layout and "Environment / running" sections.
+  - `ETF_2_Code.ipynb` — untouched (kept as the interactive reference).
+- **Related files:** `playbook_etf.py`, `.env.example`, `docs/Design-Plan.md`, `docs/TODOS.md`,
+  `docs/HISTORY.md`, `CLAUDE.md`.
+- **Test coverage:** no test suite exists (see `CLAUDE.md`). Verified in a scratch venv
+  (Python 3.10, pandas 2.3, PyMuPDF 1.28) by: (1) running the notebook's cells 5–21 verbatim and
+  the script's functions on the same cached page text of `Playbook-2026-09-07.pdf` — identical
+  58-row output, same single pre-existing `[Bullish/Hold` warning; (2) building three synthetic
+  Playbook PDFs (+ one non-matching file) from that text and running `--dry-run`/`--since` —
+  correct file selection and ordering, CSV + `_commentary.txt` written, missing-`Copyright`
+  page handled with a warning; (3) a mock `/ingest` HTTP server — correct path, bearer header,
+  title and `Date:` body line; an unreachable host with `MAX_LLMWIKI_RETRY=2` — two logged
+  failures then skip, run still completes; (4) stubbing `DU.load_df_SQL`/`DU.StoreEOD` — dates
+  already "in the DB" are skipped and only the new date reaches `StoreEOD`. Not exercised: a
+  real MySQL connection and a real llmwiki service (neither is reachable from this machine).
+
 ## 2026-09-09 — Implement page 1 parsing in new `ETF_2_Code.ipynb`
 
 - **Goal:** Implement `docs/Design-Plan.md`'s Feature B (page 1 Trade/Investor rows, including

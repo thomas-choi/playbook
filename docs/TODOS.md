@@ -25,10 +25,15 @@ when a task lands.
       add upsert support in `dataUtil.py` (`DU.StoreEOD` currently does a plain
       `to_sql(if_exists='append')` with no dedupe — re-running a notebook for an already-loaded
       date would either hit a duplicate-key error or silently duplicate rows). Once this lands,
-      flip `SKIP_DB_UPLOAD = False` in `ETF_2_Code.ipynb`.
-- [ ] **Feature A — market commentary → llmwiki.** `ETF_2_Code.ipynb` now splits physical page
-      2's trailing commentary out (saved to a local `.txt`) and has a ready `MAX_LLMWIKI_RETRY`
-      retry/skip upload function, but the actual `POST /upload` call is still gated on
-      `LLMWIKI_BASE_URL` being set — blocked on llmwiki being deployed/reachable.
+      `playbook_etf.py --force` can become a true re-load instead of an append.
+- [x] **Feature A — market commentary → llmwiki.** `playbook_etf.py` posts each PDF's page-2
+      commentary to `POST {LLMWIKI_BASE_URL}/ingest` as `{text, title}` with the date in both
+      (retry `MAX_LLMWIKI_RETRY` times, then log and skip). Still needs a reachable llmwiki to
+      exercise end-to-end; until then it logs "LLMWIKI_BASE_URL not set" and skips. The
+      notebook's `/upload` stub is superseded — see `docs/Design-Plan.md` → "Batch script".
+- [ ] **Run `playbook_etf.py` against the real Google-Drive folder** once it's mounted on the
+      target machine (`/mnt/i/My Drive/ReadProjects/Neural Matrix Investment/LCR/`) and compare
+      the first CSV with one produced by `ETF_2_Code.ipynb` for the same date. Then consider
+      scheduling it (cron) — it is safe to re-run because already-loaded dates are skipped.
 - [x] **Add `.env.example`.** Added at the repo root, covering both the existing `DB_Config.env`
       keys and the new `LLMWIKI_*` vars.
