@@ -400,7 +400,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--skip-db", action="store_true", help="parse and write CSV only, no DB upload")
     p.add_argument("--skip-llmwiki", action="store_true", help="do not send commentary to llmwiki")
     p.add_argument("--dry-run", action="store_true", help="same as --skip-db --skip-llmwiki")
-    p.add_argument("--env-file", default="DB_Config.env", help="dotenv file (default: DB_Config.env)")
+    p.add_argument("--env-file", default=".env", help="dotenv file (default: DB_Config.env)")
     p.add_argument("--out-dir", help="where to write CSV/commentary files (default: next to the PDF)")
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ... (default: INFO)")
     args = p.parse_args(argv)
@@ -431,21 +431,33 @@ def main(argv: list[str] | None = None) -> int:
 
     done = set() if (args.skip_db or args.force) else loaded_dates(db, table)
 
-    processed = skipped = failed = 0
+    processed = 0
+    skipped: list[tuple[str, str]] = []   # (filename, one-line reason)
+    failed: list[tuple[str, str]] = []
     for date_str, pdf_path in pdfs:
         if date_str in done:
-            log.info("%s: date %s already in %s.%s, skipping (use --force to re-load)",
-                     pdf_path.name, date_str, db, table)
-            skipped += 1
+            reason = f"date {date_str} already in {db}.{table} (use --force to re-load)"
+            log.info("%s: %s, skipping", pdf_path.name, reason)
+            skipped.append((pdf_path.name, reason))
             continue
         try:
             process_pdf(date_str, pdf_path, args, db, table)
             processed += 1
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             log.error("%s: failed", pdf_path.name, exc_info=True)
-            failed += 1
-    log.info("Done: %d processed, %d skipped, %d failed", processed, skipped, failed)
+            failed.append((pdf_path.name, _one_line(e)))
+    log.info("Done: %d processed, %d skipped, %d failed", processed, len(skipped), len(failed))
+    for name, reason in skipped:
+        log.info("  skipped: %s — %s", name, reason)
+    for name, reason in failed:
+        log.error("  failed:  %s — %s", name, reason)
     return 1 if failed else 0
+
+
+def _one_line(e: BaseException) -> str:
+    """``ValueError: time data ... doesn't match`` — type + first line of the message."""
+    msg = str(e).strip().split("\n", 1)[0]
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
 
 
 if __name__ == "__main__":

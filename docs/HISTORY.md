@@ -5,6 +5,38 @@ repository, per the project's mandatory change-logging rule. Newest entries at t
 
 ---
 
+## 2026-09-12 — Add `Top20_2_Code.ipynb` and `top20_stock.py` (Top20 commentary → llmwiki, batch CLI)
+
+- **Goal:** Give the Top20 pipeline the same two upgrades the Playbook pipeline got: capture the
+  market commentary from the printed page 1 and send it to llmwiki, and provide a folder-scanning
+  CLI that mirrors `playbook_etf.py`.
+- **Implementation detail:**
+  - `Top20_2_Code.ipynb` — copy of `Top20-Ubuntu.ipynb` with: a commentary split on physical
+    page 2 (from the `"Market Expectations"` line to the `Vol N Issue N` footer), saved as
+    `<pdf>_commentary.txt` and posted to `POST {LLMWIKI_BASE_URL}/ingest` as
+    `{text: "Date: …\n\n…", title: "LCR Top20 Market Commentary YYYY-MM-DD"}` with the
+    retry-then-skip policy; `load_dotenv("DB_Config.env")` with a `.env` fallback; and the nine
+    `df[col][row] = …` chained assignments in the parsing cell rewritten as `df.loc[row, col] = …`
+    because the current `.venv` (Python 3.11 / pandas 3.0.5, Copy-on-Write) silently ignores
+    chained assignment — the original notebook writes 20 all-NaN rows on that kernel.
+  - `top20_stock.py` — one function per notebook stage (`find_top20_pdfs`, `extract_text`,
+    `split_commentary`, `parse_stocks`, `derive_columns`, `finalize`, `upload_commentary`,
+    `loaded_dates`/`store`, `process_pdf`, CLI) with the same flags as `playbook_etf.py`.
+    Rows are collected as dicts (no seed row / `df[:-1]`); a line that fails to parse is logged
+    and skipped instead of aborting; the `Expiration` slice is `.strip()`ped (the PDF text has a
+    trailing space, which the explicit `%m/%d/%y` parse rejects); the `"Entry @"`/`"Target @"`
+    markers no longer require a trailing space (eight 2023 issues print `Target @250.00`).
+    Table name from `TBLSTOCKOPTIONS` (default `Stock_Options`).
+  - `.env.example` — added `TBLSTOCKOPTIONS`. `README.md`, `CLAUDE.md` — documented both.
+- **Verification:** `--dry-run` over the 29 PDFs in `~/lcr/prod/top20`: 27 × 20 rows with
+  commentary (3.5–4.7 KB each); the 2 failures are 0-byte files in the mirror. Remaining blanks:
+  four 2023 issues have one stock whose exit line omits the word `Stop`. Stubbed
+  `DU.load_df_SQL`/`DU.StoreEOD` + a mock `/ingest` server: already-loaded dates skipped, typed
+  DB frame matches the notebook's, bearer header / title / `Date:` body line correct; unreachable
+  host with `MAX_LLMWIKI_RETRY=2` logs twice and skips. Not exercised: real MySQL, real llmwiki.
+- **Related files:** `Top20_2_Code.ipynb`, `top20_stock.py`, `.env.example`, `README.md`,
+  `CLAUDE.md`, `docs/HISTORY.md`.
+
 ## 2026-09-11 — Add `playbook_etf.py` batch script (folder scan → DB → llmwiki)
 
 - **Goal:** Convert `ETF_2_Code.ipynb` into a re-runnable CLI that takes a folder, processes

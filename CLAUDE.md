@@ -18,6 +18,11 @@ workflow, not a library.
   Investor vs. Trader trends) and writes rows to the `Trading.ETF_Options` table.
 - `Top20-Ubuntu.ipynb` — parses the "Top20" PDF (per-stock entry/target/stop levels) and writes
   rows to the `Trading.Stock_Options` table.
+- `Top20_2_Code.ipynb` — v2 of the above: same parsing (written with `df.loc` so it works on
+  pandas >= 2), plus the printed-page-1 market commentary captured and sent to llmwiki.
+- `top20_stock.py` — CLI version of `Top20_2_Code.ipynb`, same shape as `playbook_etf.py`:
+  scans a folder of `*Top20 YYYY-MM-DD.pdf`, loads rows to `Trading.Stock_Options` (skipping
+  already-loaded dates) and posts the commentary to llmwiki.
 - `playbook_etf.py` — CLI version of `ETF_2_Code.ipynb`: scans a folder of Playbook PDFs, loads
   rows to `Trading.ETF_Options_v1` (skipping already-loaded dates) and sends the page-2 market
   commentary to llmwiki.
@@ -74,7 +79,9 @@ does not propagate to the other.
   processes every `*Playbook YYYY-MM-DD.pdf` in the folder with the same logic as
   `ETF_2_Code.ipynb` (one function per notebook stage), skips dates already in
   `Trading.ETF_Options_v1`, and posts the page-2 market commentary to llmwiki `/ingest`. Design
-  and options are in `docs/Design-Plan.md` → "Batch script". The Top20 notebook has no script yet.
+  and options are in `docs/Design-Plan.md` → "Batch script". `python top20_stock.py <folder>
+  [--dry-run]` does the same for `*Top20 YYYY-MM-DD.pdf` → `Trading.Stock_Options` (table name
+  from `TBLSTOCKOPTIONS`).
 - Source PDFs are read from a Google-Drive path mounted in WSL (`/mnt/i/My Drive/...`) — that
   mount and the specific dated PDF filename must exist locally before the first cell will run.
 - DB config is loaded from `DB_Config.env` (via `load_dotenv`), not `.env`; `dataUtil.py` reads
