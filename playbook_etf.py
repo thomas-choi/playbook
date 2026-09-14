@@ -298,6 +298,12 @@ def finalize(df: pd.DataFrame, date_str: str) -> tuple[pd.DataFrame, pd.DataFram
     csv_df = pd.concat([investor, trader], ignore_index=True, sort=False).fillna("")
 
     db_df = csv_df.replace(r"^\s*$", np.nan, regex=True)
+    # "Low-High" is a NOT NULL column in Trading.ETF_Options_v1, but it's legitimately blank
+    # for strike-less rows (e.g. "Major US Market" index-summary lines with no option leg) —
+    # unlike Expiration/PnC/L_Strike/H_Strike/Entry/Target/Stop, which are nullable. Undo the
+    # blanket NaN-ification above for this one column so those rows insert as "" instead of
+    # tripping a "Column 'Low-High' cannot be null" IntegrityError.
+    db_df["Low-High"] = csv_df["Low-High"]
     db_df["Date"] = pd.to_datetime(db_df["Date"], format="%Y-%m-%d")
     db_df["Expiration"] = db_df["Expiration"].map(_parse_expiration)
     db_df = db_df.astype({"L_Strike": "float", "H_Strike": "float", "Target": "float",
