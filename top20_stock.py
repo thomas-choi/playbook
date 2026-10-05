@@ -54,6 +54,10 @@ OUTPUT_COLUMNS = ["Date", "Symbol", "Status", "Expiration", "PnC", "Strike", "En
                   "Entry2", "Target_Sign", "Target", "Stop_Sign", "Stop"]
 # NOT NULL in Trading.Stock_Options_v1, and its primary key.
 KEY_COLUMNS = ["Date", "Symbol"]
+# The key column a person can supply (Date comes from the filename). No fixed choices: the answer
+# is a ticker, typed or accepted from the candidate the parser found.
+CONFIRM_FIELDS = ("Symbol",)
+CONFIRM_CHOICES: dict[str, tuple[str, ...]] = {}
 NUMERIC_FIELDS = ("Price", "Entry1", "Entry2", "Target", "Stop")
 
 NUM_RE = r"\d+(\.)?\d+"          # strike matcher (needs >= 2 digits), kept as in the notebook
@@ -170,6 +174,21 @@ def _numbers(text: str) -> list[str]:
     return [m[0] for m in re.finditer(NUM_RE, text)]
 
 
+def _symbol_from_section(lines: list[str], start: int) -> str:
+    """The ticker a heading without a ``[TICKER]`` refers to: its own ``@ UBER 27.87 Stop``.
+
+    ``912 Top20 2022-12-19`` prints "Uber Technologies Inc" with no bracket, but its conditional
+    exit names the symbol — the only place the section does.
+    """
+    for line in lines[start + 1:]:
+        if SYMBOL_RE.search(line):      # the next stock heading ends this section
+            break
+        cand = lr.ticker_candidate(line)
+        if cand:
+            return cand
+    return ""
+
+
 def _prices(text: str) -> list[str]:
     return [m.group() for m in PRICE_RE.finditer(text)]
 
@@ -224,13 +243,19 @@ def parse_stocks(stock_text: str,
             if (sm is None and not _is_status_line(line) and _is_status_line(nxt)
                     and 3 < len(line.strip()) < 60 and not re.search(r"[\[\]\d@]", line)):
                 # A stock heading whose ticker the PDF dropped: open the section anyway so the
-                # next stock's levels do not land on the previous stock's row. The row is flagged
-                # and (with no Symbol) kept out of the DB until the LLM repair supplies one.
+                # next stock's levels do not land on the previous stock's row. ``Symbol`` is in
+                # the table's primary key, so it is *labelled* missing — with the ticker from the
+                # section's own "@ UBER 27.87 Stop" as the candidate — and confirmed by a person
+                # (``confirm_missing``) or supplied by the LLM repair.
                 report.close_block(end=i, row_end=len(rows), final=True)
                 symbol, row = "", None
                 status, status_line = nxt.split()[0], lines.index(nxt, i + 1)
                 report.open_block(line.strip()[:30], header_line=i, start=i, row_start=len(rows))
-                report.flag("incomplete", line, "stock heading without a [TICKER]")
+                cand = _symbol_from_section(lines, i)
+                report.mark_missing(
+                    "Symbol", f"the heading {line.strip()[:40]!r} has no [TICKER]",
+                    suggest=cand,
+                    source=f"a '@ {cand} price' in this section" if cand else "")
                 continue
             if sm:
                 # "Bank of America Corp [BAC]" opens a section; the next non-blank line is the
@@ -350,6 +375,18 @@ def _coerce_row(row: dict, fallback: list[dict]) -> dict:
     return out
 
 
+def confirm_missing(rows: list[dict], lines: list[str], report: lr.ParseReport,
+                    source: str) -> int:
+    """Ask a person for every Symbol the parser labelled as missing; returns blocks answered.
+
+    ``Symbol`` is part of ``Trading.Stock_Options_v1``'s primary key, so ``split_loadable``
+    rejects a row without one and the stock never reaches the table.
+    """
+    return hil.confirm_missing(rows, lines, report, source=source, fields=CONFIRM_FIELDS,
+                               choices=CONFIRM_CHOICES, columns=ROW_COLUMNS,
+                               numeric_fields=NUMERIC_FIELDS, row_schema=ROW_SCHEMA)
+
+
 def run_repairs(rows: list[dict], lines: list[str], report: lr.ParseReport,
                 mode: str, source: str) -> lr.RepairLog | None:
     """Re-read flagged blocks (``--llm repair``) or every block (``force``) with the LLM."""
@@ -380,6 +417,7 @@ def run_repairs(rows: list[dict], lines: list[str], report: lr.ParseReport,
             rlog.add(b, before, new, "rejected", reason)
             continue
         report.replace_rows(rows, b, new)
+        hil.reapply_answers(rows, b)   # a repair must not drop what a person just confirmed
         log.info("%s: LLM repair accepted (%d rows -> %d)", b.block_id, len(before), len(new))
         rlog.add(b, before, new, "accepted")
     return rlog
@@ -522,16 +560,33 @@ def process_pdf(date_str: str, pdf_path: Path, args: argparse.Namespace, db: str
     report = lr.ParseReport(pdf_path.name)
     rows, lines = parse_stocks(stock_text, report)
     flag_duplicate_symbols(rows, report)
-    store = hil.get_store(hil.store_path(pdf_path, args.decisions))
-    hil.apply_decisions(rows, lines, report, store, "top20")
+    hil.label_missing_keys(rows, lines, report, CONFIRM_FIELDS)
+    decisions = hil.get_store(hil.store_path(pdf_path, args.decisions))
+    hil.apply_decisions(rows, lines, report, decisions, "top20")
     if not rows:
         raise ValueError("no stock rows parsed (no '[SYMBOL]' sections found on pages 3+)")
+    # Asked before the LLM: a ticker the PDF never printed in brackets is quicker to confirm off
+    # the section text than to wait for a repair round-trip.
+    if args.confirm:
+        confirm_missing(rows, lines, report, pdf_path.name)
     repairs = run_repairs(rows, lines, report, args.llm, pdf_path.name)
     if args.review:
-        if hil.review(rows, lines, report, store, repairs, publication="top20",
+        if hil.review(rows, lines, report, decisions, repairs, publication="top20",
                       source=pdf_path.name, date=date_str, columns=ROW_COLUMNS,
                       numeric_fields=NUMERIC_FIELDS, row_schema=ROW_SCHEMA, new_row=_new_row):
-            store.save()
+            decisions.save()
+    # Recorded last, holding each confirmed block's rows as they finally stand, so a replay (or a
+    # --replace-date reload) reproduces what this run loaded without an LLM call.
+    if hil.record_confirmations(rows, lines, report, decisions, publication="top20",
+                                source=pdf_path.name, date=date_str):
+        decisions.save()
+    blank_rows = [i for i, r in enumerate(rows)
+                  if any(not str(r.get(f) or "").strip() for f in CONFIRM_FIELDS)]
+    if blank_rows:
+        log.warning("%s: %d row(s) still have no %s and cannot load (rows %s)%s",
+                    pdf_path.name, len(blank_rows), "/".join(CONFIRM_FIELDS),
+                    ", ".join(str(i) for i in blank_rows),
+                    "" if args.confirm else " — drop --no-confirm to be asked about them")
     unsettled = report.unsettled_blocks()
     if unsettled and not args.review:
         log.warning("%s: %d block(s) still need a human decision (--review): %s", pdf_path.name,
@@ -569,13 +624,56 @@ def process_pdf(date_str: str, pdf_path: Path, args: argparse.Namespace, db: str
     else:
         failed_rows = store(loadable, db, table, date_str, args.replace_date)
 
+    sent = False
     if args.skip_llmwiki:
         log.info("%s: --skip-llmwiki, not sending commentary.", pdf_path.name)
     elif commentary_text:
-        upload_commentary(commentary_text, date_str)
+        sent = upload_commentary(commentary_text, date_str)
+    # Configured, attempted and failed — the date is not finished, whatever the DB says.
+    llmwiki_pending = bool(commentary_text) and not args.skip_llmwiki and not sent \
+        and bool(os.environ.get("LLMWIKI_BASE_URL"))
+
+    if args.clean:
+        clean_scratch_files(pdf_path, [text_path, report_path], args, failed_rows=failed_rows,
+                            rejected=len(rejected), unsettled=len(unsettled),
+                            blank_rows=len(blank_rows), llmwiki_pending=llmwiki_pending)
 
     return {"rows": len(csv_df), "loaded": len(loadable), "rejected": len(rejected),
             "failed_rows": failed_rows, "unsettled": len(unsettled)}
+
+
+def clean_scratch_files(pdf_path: Path, paths: list[Path], args: argparse.Namespace, *,
+                        failed_rows: int, rejected: int, unsettled: int, blank_rows: int,
+                        llmwiki_pending: bool) -> None:
+    """Drop the rebuildable reports once the date is actually done. The default; see ``--no-clean``.
+
+    "Done" is the whole job, not just the last step: every parsed row loaded, none rejected, no
+    column left for a person to answer, and the commentary delivered. Anything else and the text
+    and parse report are exactly what you would want to read next, so they stay and the run says
+    why. A verify pass (``--csv-only``) loads nothing, so it never cleans — its reports are the
+    point of it.
+    """
+    if args.skip_db:
+        log.debug("%s: nothing was loaded, keeping the run's reports.", pdf_path.name)
+        return
+    reasons = []
+    if failed_rows:
+        reasons.append(f"{failed_rows} row(s) did not load")
+    if rejected:
+        reasons.append(f"{rejected} row(s) were rejected")
+    if unsettled:
+        reasons.append(f"{unsettled} block(s) are unsettled")
+    if blank_rows:
+        reasons.append(f"{blank_rows} row(s) have no {'/'.join(CONFIRM_FIELDS)}")
+    if llmwiki_pending:
+        reasons.append("the commentary did not reach llmwiki")
+    if reasons:
+        log.info("%s: keeping %s and the parse report — %s.", pdf_path.name,
+                 paths[0].name, "; ".join(reasons))
+        return
+    gone = lr.clean_scratch(paths)
+    if gone:
+        log.info("%s: cleaned %s", pdf_path.name, ", ".join(p.name for p in gone))
 
 
 # --------------------------------------------------------------------------------------------
@@ -598,11 +696,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--review", action="store_true",
                    help="ask about every block the regexes flagged and the LLM did not settle, and "
                         "remember each answer (see --decisions)")
+    p.add_argument("--no-confirm", dest="confirm", action="store_false",
+                   help="do not ask about a Symbol the parser could not read (it is in the "
+                        "table's primary key, so such a row is rejected instead of loaded)")
     p.add_argument("--decisions", metavar="PATH",
                    help="decisions store for --review answers "
                         "(default: .pdfreader-decisions.json next to the PDF)")
     p.add_argument("--csv-only", action="store_true",
                    help="write CSV + text + reports only — no DB, no llmwiki (verify first)")
+    p.add_argument("--clean", action="store_true", default=True,
+                   help="the default: once a date has loaded completely, delete its rebuildable "
+                        "reports (<stem>.txt, <stem>.parse-report.json)")
+    p.add_argument("--no-clean", dest="clean", action="store_false",
+                   help="keep a loaded date's <stem>.txt and <stem>.parse-report.json. They are "
+                        "kept anyway whenever a row was rejected, a block is unsettled or the "
+                        "commentary did not post — that is when they are worth reading")
     p.add_argument("--skip-db", action="store_true", help="parse and write CSV only, no DB upload")
     p.add_argument("--skip-llmwiki", action="store_true", help="do not send commentary to llmwiki")
     p.add_argument("--dry-run", action="store_true", help="same as --csv-only")

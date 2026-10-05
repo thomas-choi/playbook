@@ -38,10 +38,47 @@ CONTENT_HINT_RE = re.compile(
 
 NUMBER_IN_TEXT_RE = re.compile(r"\d*\.?\d+")
 
+# "conditional Target @ WMT 114.45", "Exit to BTC Naked Call @ UBER 27.87 Stop"
+AT_TICKER_RE = re.compile(r"@\s*([A-Z]{1,6})\s+[\d.]")
+
 
 # --------------------------------------------------------------------------------------------
 # Parse report
 # --------------------------------------------------------------------------------------------
+@dataclass
+class Missing:
+    """A required column the regexes could not read, labelled where they gave up.
+
+    ``suggest`` is the parser's candidate and ``source`` says where it came from, so the person
+    asked at ``hil_review.confirm_missing`` can accept it with one keystroke instead of reading the
+    value out of the block themselves. ``answer`` is what they chose.
+    """
+    field: str
+    reason: str
+    suggest: str = ""
+    source: str = ""
+    answer: str = ""
+    answered_by: str = ""
+
+    def as_dict(self) -> dict:
+        d = {"field": self.field, "reason": self.reason}
+        for k in ("suggest", "source", "answer", "answered_by"):
+            if getattr(self, k):
+                d[k] = getattr(self, k)
+        return d
+
+
+def ticker_candidate(text: str) -> str:
+    """The ticker in a ``@ WMT 114.45`` / ``@ UBER 27.87 Stop`` reference, or ``""``.
+
+    Both publications print the underlying's symbol beside a conditional price, which is the only
+    place a section names its ticker when the heading does not (``Walmart Inc
+    [Bullish/Countertrend]``, or a Top20 stock heading whose ``[TICKER]`` the PDF dropped).
+    """
+    m = AT_TICKER_RE.search(text)
+    return m.group(1) if m else ""
+
+
 @dataclass
 class Flag:
     """One thing the parser could not do with a line."""
@@ -68,15 +105,30 @@ class Block:
     flags: list[Flag] = field(default_factory=list)
     repair: str = ""             # "", "accepted", "rejected: <reason>", "unavailable"
     decision: str = ""           # a human answer from hil_review, e.g. "keep_regex", "no_value"
+    # {column: Missing} — required columns the parser could not read, labelled at the line where
+    # it gave up and answered by confirm_missing.
+    missing: dict[str, Missing] = field(default_factory=dict)
+
+    @property
+    def unanswered(self) -> list[str]:
+        """Labelled columns still without an answer, in the order they were labelled."""
+        return [f for f, m in self.missing.items() if not m.answer]
 
     @property
     def flagged(self) -> bool:
-        return bool(self.flags)
+        """Something to ask about: a line the parser could not use, or a column it never read."""
+        return bool(self.flags) or bool(self.unanswered)
 
     @property
     def settled(self) -> bool:
         """Nothing left to ask: not flagged, repaired and accepted, or decided by a person."""
+        if self.unanswered:
+            return False      # no repair or decision can stand in for a column nobody supplied
         return not self.flags or self.repair == "accepted" or bool(self.decision)
+
+    def answers(self) -> dict[str, str]:
+        """``{column: answer}`` for the labels a person has answered."""
+        return {f: m.answer for f, m in self.missing.items() if m.answer}
 
     def text(self, lines: list[str]) -> str:
         kept = [l.rstrip() for l in lines[self.start:self.end]]
@@ -88,10 +140,13 @@ class Block:
         return body
 
     def as_dict(self) -> dict:
-        return {"block": self.block_id, "symbol": self.symbol, "trend": self.trend,
-                "lines": [self.start, self.end], "rows": [self.row_start, self.row_end],
-                "repair": self.repair, "decision": self.decision,
-                "flags": [f.as_dict() for f in self.flags]}
+        d = {"block": self.block_id, "symbol": self.symbol, "trend": self.trend,
+             "lines": [self.start, self.end], "rows": [self.row_start, self.row_end],
+             "repair": self.repair, "decision": self.decision,
+             "flags": [f.as_dict() for f in self.flags]}
+        if self.missing:
+            d["missing"] = {f: m.as_dict() for f, m in self.missing.items()}
+        return d
 
 
 class ParseReport:
@@ -138,6 +193,23 @@ class ParseReport:
         f = Flag(kind, line, detail)
         (self.current.flags if self.current else self.orphans).append(f)
 
+    def mark_missing(self, field_name: str, reason: str, *, suggest: str = "",
+                     source: str = "") -> Missing | None:
+        """Label the open block as missing a required column; ``None`` if no block is open.
+
+        Called where the regexes give up, not afterwards: only the parser knows *why* the column
+        is not there, and the reason is what the person asked for it reads first.
+        """
+        if self.current is None:
+            return None
+        m = Missing(field=field_name, reason=reason, suggest=suggest, source=source)
+        self.current.missing[field_name] = m
+        return m
+
+    def missing_blocks(self) -> list[Block]:
+        """Blocks with a labelled column nobody has answered yet."""
+        return [b for b in self.blocks if b.unanswered]
+
     # -- reading -----------------------------------------------------------------------------
     def flagged_blocks(self) -> list[Block]:
         """Blocks with a flag and no recorded human decision — what the LLM is asked about."""
@@ -173,8 +245,10 @@ class ParseReport:
 
     def summary(self) -> str:
         c = self.counts()
+        miss = sum(len(b.unanswered) for b in self.blocks)
         return (f"{len(self.blocks)} blocks, {len([b for b in self.blocks if b.flagged])} "
                 f"flagged, {len(self.unsettled_blocks())} unsettled"
+                + (f", {miss} column(s) missing" if miss else "")
                 + (f" ({', '.join(f'{k}={v}' for k, v in sorted(c.items()))})" if c else ""))
 
     def write(self, path: Path) -> None:
@@ -386,3 +460,27 @@ class RepairLog:
                                     "accepted": self.accepted, "rejected": self.rejected,
                                     "unavailable": self.unavailable,
                                     "calls": self.entries}, indent=2))
+
+
+# --------------------------------------------------------------------------------------------
+# Scratch artefacts
+# --------------------------------------------------------------------------------------------
+def clean_scratch(paths: list[Path]) -> list[Path]:
+    """Delete a run's rebuildable debugging artefacts; returns the ones that went.
+
+    Only the files the *next* run of the same code recreates byte for byte belong here — the
+    extracted text and the parse report. Not the CSV (the record of what loaded), not
+    ``.repairs.json`` (an LLM call is not reproducible), and never the decisions store, which is
+    the one artefact nothing can recompute. Callers decide *when* it is safe: on a run that did
+    not finish its job these files are the evidence, so they stay.
+    """
+    gone = []
+    for p in paths:
+        try:
+            p.unlink()
+            gone.append(p)
+        except FileNotFoundError:
+            pass
+        except OSError as e:  # noqa: BLE001 - tidying up must not fail a finished load
+            log.warning("could not remove %s (%s)", p, _one_line(e))
+    return gone

@@ -28,7 +28,9 @@ Always CSV-first, then upload:
 ```
 
 Other flags: `--since YYYY-MM-DD`, `--out-dir`, `--skip-db`, `--skip-llmwiki`, `--log-level DEBUG`,
-and `--llm off|repair|force` (below). A non-zero exit means a file failed, a row could not be
+`--llm off|repair|force` (below), `--no-confirm` (don't ask about a Symbol the parser could not
+read) and `--no-clean` (keep a loaded date's `<stem>.txt` and
+`<stem>.parse-report.json`, which a completed load deletes). A non-zero exit means a file failed, a row could not be
 loaded, or an LLM repair was rejected — the summary line names the counts.
 
 ## What it writes next to the PDF (or in `--out-dir`)
@@ -43,15 +45,23 @@ loaded, or an LLM repair was rejected — the summary line names the counts.
 | `<stem>.rejected.csv` | rows the table cannot take (no `Symbol`, duplicate `(Date, Symbol)`) with a `_reason` column |
 | `<stem>_commentary.txt` | the `Market Expectations ...` block sent to llmwiki |
 
+`<stem>.txt` and `<stem>.parse-report.json` are rebuilt from the PDF on every run, so a date that
+loads completely deletes them (`--no-clean` keeps them; a date with a rejected row, an unsettled
+block or an undelivered commentary keeps them anyway). The decisions store is the one file nothing
+can recompute — keep it.
+
 ## Reading a parse report
 
 A healthy issue is `"20 blocks, 0 flagged"`. The flags are `exception`, `unconsumed`, `incomplete`
 (see the Playbook skill for the same taxonomy). Two Top20-specific ones matter most:
 
-- `stock heading without a [TICKER]` — the PDF printed a company name with no ticker
-  (`912 Top20 2022-12-19`, "Uber Technologies Inc"). The section is still opened, so the next
-  stock's levels no longer overwrite the previous stock's row; the row has no `Symbol`, lands in
-  `.rejected.csv`, and is what the LLM repair is for.
+- `the heading '<company>' has no [TICKER]` — not a flag but a **label**: the PDF printed a company
+  name with no ticker (`912 Top20 2022-12-19`, "Uber Technologies Inc"). The section is still
+  opened, so the next stock's levels no longer overwrite the previous stock's row, and because
+  `Symbol` is half the primary key you are asked for it on any interactive run — before the LLM,
+  with the ticker from the section's own `@ UBER 27.87 Stop` as the candidate, so Enter is enough
+  (see "A missing Symbol is always asked about" below). With no terminal, or under `--no-confirm`,
+  the row has no `Symbol` and lands in `.rejected.csv` for the LLM or the next interactive run.
 - `<field> is already '<value>' — a second stock may be in this block` — two trade suggestions in
   one section. `LCR Top20 2020-05-18` has Playbook-style two-leg combos (PENN, UBER); the table
   holds one leg per symbol, so the first leg wins and the rest is flagged.
@@ -95,9 +105,33 @@ unattended run cannot block. Without `--review`, unsettled blocks are logged
 in the regexes and in the extraction spec instead.
 
 Top20-specific: `flag_duplicate_symbols` flags both blocks when a ticker appears twice in one issue
-(`Date, Symbol` is the key). The ticker-less heading in `912 Top20 2022-12-19` is answered with
-`[3] set a field` → `Symbol` → `UBER`; the two combo sections in `LCR Top20 2020-05-18` (PENN, UBER)
-are answered `keep_regex` once you have decided which leg the one row should hold.
+(`Date, Symbol` is the key). The two combo sections in `LCR Top20 2020-05-18` (PENN, UBER) are
+answered `keep_regex` once you have decided which leg the one row should hold.
+
+## A missing Symbol is always asked about
+
+`Symbol` is half of `Stock_Options_v1`'s primary key, so a section whose `[TICKER]` the PDF dropped
+cannot load at all. That question is not behind `--review`: it is asked on every interactive run and
+**before** the LLM, with the parser's candidate pre-filled.
+
+```
+912 Top20 2022-12-19.pdf: 1 block(s) are missing a required column (Symbol)
+[1/1] Uber Technologies Inc   rows 12-12
+     Uber Technologies Inc
+     Underperform/Sell
+     …
+     conditional position Exit to BTC Naked Call @ UBER 27.87 Stop
+    [12] Status=Underperform/Sell  Expiration=1/20/23  PnC=C  Price=28  Entry1=28.00  …
+  Symbol — the heading 'Uber Technologies Inc' has no [TICKER]
+    candidate: UBER   (from a '@ UBER price' in this section)
+    [Enter] accept UBER      [s] skip for now      [q] stop asking
+```
+
+One keystroke and all 20 rows load with nothing in `.rejected.csv`. A ticker you type is checked the
+way the model's is — one that appears nowhere in the section text is refused unless you insist. The
+answer is recorded with the block's final rows at the end of the run, so a re-run or a
+`--replace-date` reload reproduces it with nobody present, and an accepted LLM repair cannot
+overwrite it. `--no-confirm` turns the question off.
 
 ## When the PDF changes shape
 

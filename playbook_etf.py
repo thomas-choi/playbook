@@ -69,8 +69,22 @@ ACTION_RE = re.compile(r"\b(BTO|STO)\b\s*(\d+)?")
 NET_ENTRY_RE = re.compile(r"Entry of a net\s+([\d.]+)\s+(Credit|Debit)", re.IGNORECASE)
 SYMBOL_RE = re.compile(r"\[(\w+)\]")
 TREND_RE = re.compile(r"\b(Investor|Trader)\b")
+# The only two Trend groups the publication prints, and the choices the Trend question offers.
+TREND_VALUES = ("Investor", "Trader")
+# The key columns a person can supply (Date comes from the filename, Low-High from the strikes),
+# asked in this order so a block names itself before it is asked which Trend it is.
+CONFIRM_FIELDS = ("Symbol", "Trend")
+CONFIRM_CHOICES = {"Trend": TREND_VALUES}
 # "[Bullish/Counter Trend]" (spaces) and the line-wrapped "[Bullish/Hold" (no closing bracket)
 STATUS_RE = re.compile(r"\[([^\]\n]*)\]?")
+# A group heading that states the status instead of the ticker and never prints a Trend line of
+# its own: "Walmart Inc [Bullish/Countertrend]" under "Featured Investor & Maintenance
+# Suggestions" (912 Playbook 2026-10-05). Group 1 is the company name, group 2 the status; an
+# all-caps bracket is a ticker, not a status, so "Walmart Inc [WMT]" is left to SYMBOL_RE.
+STATUS_HEAD_RE = re.compile(r"^\s*([A-Za-z][^\[\]]*?)\s*\[([^\]\n]*?)\]?\s*$")
+STATUS_WORD_RE = re.compile(r"\b(Bullish|Bearish|Neutral|Hold|Counter\s?trend)\b", re.IGNORECASE)
+# "conditional Target @ LEN 98.62" — the only place a status-headed group names its ticker.
+AT_SYMBOL_RE = re.compile(r"@\s*([A-Z]{1,6})\s+[\d.]")
 PNC_RE = re.compile(r"\b(put|call)", re.IGNORECASE)
 STOP_RE = re.compile(r"\b(Stop|Exit)\b", re.IGNORECASE)
 
@@ -183,6 +197,39 @@ def _numbers(text: str) -> list[str]:
     return [m[0] for m in re.finditer(NUM_RE, text)]
 
 
+def _status_head(line: str) -> tuple[str, str] | None:
+    """``(company name, status)`` of a status-only group heading, else ``None``.
+
+    "Walmart Inc [Bullish/Countertrend]" is one; "Walmart Inc [WMT]" is a symbol heading (an
+    all-caps bracket is a ticker), and "Trader Trend [Bullish]" / "Intermediate Trend [Bullish]"
+    are Trend lines — whatever is left of the bracket there names the trend, not a company, so
+    they belong to the Trend branch even when the trend word itself is unreadable.
+    """
+    m = STATUS_HEAD_RE.match(line)
+    if (m and TREND_RE.search(line) is None and "Trend" not in m.group(1)
+            and not m.group(2).isupper() and STATUS_WORD_RE.search(m.group(2))):
+        return m.group(1).strip(), m.group(2).strip()
+    return None
+
+
+def _symbol_from_group(lines: list[str], start: int) -> str:
+    """The ticker a status-headed group refers to: the first ``@ LEN 98.62`` in its own lines.
+
+    Such a heading names the company but not the ticker, and it is not always the same company as
+    the section above it — ``912 Playbook 2026-09-21`` prints `Lennar Corp [Bullish/Countertrend]`
+    under Boeing's section, so carrying the previous symbol over would file Lennar's legs under
+    BA. The group's own conditional prices are the one reliable source.
+    """
+    for line in lines[start + 1:]:
+        if (SECTION_RE.search(line) or _status_head(line)
+                or (SYMBOL_RE.search(line) and "Trend" not in line)):
+            break
+        m = AT_SYMBOL_RE.search(line)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def _prices(text: str) -> list[str]:
     """Prices, including the PDF's ``.25`` form."""
     return [m.group() for m in PRICE_RE.finditer(text)]
@@ -221,6 +268,10 @@ def parse_trades(table_text: str,
     status = None
     trend = None
     symbol_line = -1
+    symbol_name = ""     # company name on the "<name> [TICKER]" heading, to spot a new company
+    prev_symbol = ""     # last ticker read from a "<name> [TICKER]" heading, as a candidate only
+    section_trend = ""   # "Featured Investor & Maintenance Suggestions" -> Investor, as a hint
+    section_header = ""  # that heading's text, shown as the candidate's provenance
     line_num = -1
     group_start = 0      # index into ``rows`` of the current Trend group (for combo broadcast)
     is_combo = False     # set once an "Entry of a net ... Credit/Debit" line is seen
@@ -231,6 +282,9 @@ def parse_trades(table_text: str,
             m = SECTION_RE.search(line)
             if m:
                 report.close_block(end=i, row_end=len(rows), final=True)
+                stm = TREND_RE.search(line)
+                section_trend = stm.group(1) if stm else ""
+                section_header = line.strip()
                 asset_class = line[:m.start()].strip()
                 if asset_class:
                     type_name = asset_class
@@ -240,28 +294,83 @@ def parse_trades(table_text: str,
                 continue
             if line.strip() == "" or SKIP_RE.search(line):
                 continue
+            sh = _status_head(line)
+            if sh:
+                # A group heading that gives the status where the ticker usually is and never
+                # prints an "Investor/Trader Trend" line (the "Featured Investor" sections of
+                # 912 Playbook 2026-10-05 and 2026-09-21). Opening a group here is what stops the
+                # legs below it from inheriting the previous group's Trend and Status, and what
+                # keeps the net-Entry broadcast out of that group. Neither the Symbol nor the
+                # Trend is stated where the parser can read it, so both are *labelled* missing
+                # with a candidate and confirmed by a person — the heading's company name is not
+                # always the section's (Lennar under Boeing), so inheriting the open ticker is
+                # exactly the mistake that filed Lennar's legs as BA.
+                report.close_block(end=i, row_end=len(rows), final=True)
+                name, status = sh
+                trend, symbol = "", ""
+                same_company = bool(symbol_name) and name.lower() == symbol_name.lower()
+                sym_here = _symbol_from_group(lines, i)
+                symbol_name = name if not same_company else symbol_name
+                line_num, group_start, is_combo = 1, len(rows), False
+                report.open_block(f"{name.split()[0][:12]}/?", symbol="", trend="",
+                                  header_line=symbol_line if same_company else -1,
+                                  start=i, row_start=len(rows))
+                report.mark_missing(
+                    "Symbol", f"the heading {name!r} states the status, not a [TICKER]",
+                    suggest=sym_here or (prev_symbol if same_company else ""),
+                    source=(f"a '@ {sym_here} price' in this group" if sym_here else
+                            f"the [{prev_symbol}] heading above, same company name"
+                            if same_company and prev_symbol else ""))
+                report.mark_missing(
+                    "Trend", "the group states no Investor/Trader Trend",
+                    suggest=section_trend,
+                    source=f"the section heading {section_header!r}" if section_trend else "")
+                continue
             sm = SYMBOL_RE.search(line)
             if "Trend" not in line and sm:
                 report.close_block(end=i, row_end=len(rows), final=True)
-                symbol = sm.group(1)
+                symbol = prev_symbol = sm.group(1)
+                symbol_name = line[:sm.start()].strip()
                 symbol_line, line_num = i, 0
                 log.debug("Symbol = %s", symbol)
                 continue
             if line_num == 0 or line.find("Trend") > 0:
                 tm = TREND_RE.search(line)
-                if tm is None:
+                if tm is None and line_num != 0:
+                    # A wrapped "... Counter Trend]" continuation mid-block, not a group header.
                     report.flag("unconsumed", line, "Trend line without Investor/Trader")
                     continue
-                trend = tm.group(1)
+                # No Investor/Trader on the line that should carry it: open the group anyway
+                # with an empty Trend, so the legs below it are still parsed instead of every one
+                # of them falling back into this branch and the whole symbol being lost. The
+                # Trend is labelled missing rather than flagged; ``label_missing_keys`` drops the
+                # label again if the group produced no rows, so a heading line that simply is not
+                # a Trend line is nothing to ask about.
+                trend = tm.group(1) if tm else ""
                 st = STATUS_RE.search(line)
                 status = st.group(1).strip() if st else ""
                 line_num, group_start, is_combo = 1, len(rows), False
-                report.open_block(f"{symbol}/{trend}", symbol=symbol or "", trend=trend,
+                report.open_block(f"{symbol}/{trend or '?'}", symbol=symbol or "", trend=trend,
                                   header_line=symbol_line, start=i, row_start=len(rows))
+                if not trend:
+                    report.mark_missing("Trend", "no Investor/Trader on the group's header line",
+                                        suggest=section_trend,
+                                        source=f"the section heading {section_header!r}"
+                                               if section_trend else "")
                 if not status:
                     report.flag("incomplete", line, "no [status] on the Trend line")
                 continue
             if "STO" in line or "BTO" in line:
+                if not report.blocks:
+                    # A leg before any symbol heading or Trend line (the extraction dropped them):
+                    # give it a block so the LLM and confirm_missing can still see the row.
+                    report.open_block(f"{symbol or '?'}/{trend or '?'}", symbol=symbol or "",
+                                      trend=trend or "", header_line=symbol_line, start=i,
+                                      row_start=len(rows))
+                    if not symbol:
+                        report.mark_missing("Symbol", "legs printed before any [TICKER] heading")
+                    if not trend:
+                        report.mark_missing("Trend", "legs printed before any Trend line")
                 row = _new_row()
                 rows.append(row)          # appended first so a partial parse still keeps the row
                 row["Type"] = type_name
@@ -385,6 +494,19 @@ def flag_duplicate_legs(rows: list[dict], report: lr.ParseReport) -> None:
                 first.setdefault(key, (b, i))
 
 
+def confirm_missing(rows: list[dict], lines: list[str], report: lr.ParseReport,
+                    source: str) -> int:
+    """Ask a person for every Symbol/Trend the parser labelled as missing; returns blocks answered.
+
+    ``Symbol`` is asked before ``Trend`` so the block names itself first. Both are part of
+    ``Trading.ETF_Options_v1``'s primary key, so this is not a cosmetic gap: ``split_loadable``
+    rejects a row without them and the leg never reaches the table.
+    """
+    return hil.confirm_missing(rows, lines, report, source=source, fields=CONFIRM_FIELDS,
+                               choices=CONFIRM_CHOICES, columns=ROW_COLUMNS,
+                               numeric_fields=NUMERIC_FIELDS, row_schema=ROW_SCHEMA)
+
+
 # --------------------------------------------------------------------------------------------
 # 3b. LLM repair of the flagged blocks
 # --------------------------------------------------------------------------------------------
@@ -437,6 +559,7 @@ def run_repairs(rows: list[dict], lines: list[str], report: lr.ParseReport,
             rlog.add(b, before, new, "rejected", reason)
             continue
         report.replace_rows(rows, b, new)
+        hil.reapply_answers(rows, b)   # a repair must not drop what a person just confirmed
         log.info("%s: LLM repair accepted (%d rows -> %d)", b.block_id, len(before), len(new))
         rlog.add(b, before, new, "accepted")
     return rlog
@@ -650,14 +773,33 @@ def process_pdf(date_str: str, pdf_path: Path, args: argparse.Namespace, db: str
     report = lr.ParseReport(pdf_path.name)
     rows, lines = parse_trades(table_text, report)
     flag_duplicate_legs(rows, report)
-    store = hil.get_store(hil.store_path(pdf_path, args.decisions))
-    hil.apply_decisions(rows, lines, report, store, "playbook")
+    hil.label_missing_keys(rows, lines, report, CONFIRM_FIELDS)
+    decisions = hil.get_store(hil.store_path(pdf_path, args.decisions))
+    hil.apply_decisions(rows, lines, report, decisions, "playbook")
+    # Asked before the LLM: a key column the regexes could not read is quicker to confirm off the
+    # block text than to wait for a repair round-trip, and the answer goes to the model as given.
+    if args.confirm:
+        confirm_missing(rows, lines, report, pdf_path.name)
     repairs = run_repairs(rows, lines, report, args.llm, pdf_path.name)
     if args.review:
-        if hil.review(rows, lines, report, store, repairs, publication="playbook",
+        if hil.review(rows, lines, report, decisions, repairs, publication="playbook",
                       source=pdf_path.name, date=date_str, columns=ROW_COLUMNS,
                       numeric_fields=NUMERIC_FIELDS, row_schema=ROW_SCHEMA, new_row=_new_row):
-            store.save()
+            decisions.save()
+    # Recorded last, holding each confirmed block's rows as they finally stand, so a replay (or a
+    # --replace-date reload) reproduces what this run loaded without an LLM call.
+    if hil.record_confirmations(rows, lines, report, decisions, publication="playbook",
+                                source=pdf_path.name, date=date_str):
+        decisions.save()
+    blank_rows = [i for i, r in enumerate(rows)
+                  if any(not str(r.get(f) or "").strip() for f in CONFIRM_FIELDS)]
+    if blank_rows:
+        cols = [f for f in CONFIRM_FIELDS
+                if any(not str(rows[i].get(f) or "").strip() for i in blank_rows)]
+        log.warning("%s: %d row(s) still have no %s and cannot load (rows %s)%s",
+                    pdf_path.name, len(blank_rows), "/".join(cols),
+                    ", ".join(str(i) for i in blank_rows),
+                    "" if args.confirm else " — drop --no-confirm to be asked about them")
     unsettled = report.unsettled_blocks()
     if unsettled and not args.review:
         log.warning("%s: %d block(s) still need a human decision (--review): %s", pdf_path.name,
@@ -695,13 +837,56 @@ def process_pdf(date_str: str, pdf_path: Path, args: argparse.Namespace, db: str
     else:
         failed_rows = store(loadable, db, table, date_str, args.replace_date)
 
+    sent = False
     if args.skip_llmwiki:
         log.info("%s: --skip-llmwiki, not sending commentary.", pdf_path.name)
     elif commentary_text:
-        upload_commentary(commentary_text, date_str)
+        sent = upload_commentary(commentary_text, date_str)
+    # Configured, attempted and failed — the date is not finished, whatever the DB says.
+    llmwiki_pending = bool(commentary_text) and not args.skip_llmwiki and not sent \
+        and bool(os.environ.get("LLMWIKI_BASE_URL"))
+
+    if args.clean:
+        clean_scratch_files(pdf_path, [text_path, report_path], args, failed_rows=failed_rows,
+                            rejected=len(rejected), unsettled=len(unsettled),
+                            blank_rows=len(blank_rows), llmwiki_pending=llmwiki_pending)
 
     return {"rows": len(csv_df), "loaded": len(loadable), "rejected": len(rejected),
             "failed_rows": failed_rows, "unsettled": len(unsettled)}
+
+
+def clean_scratch_files(pdf_path: Path, paths: list[Path], args: argparse.Namespace, *,
+                        failed_rows: int, rejected: int, unsettled: int, blank_rows: int,
+                        llmwiki_pending: bool) -> None:
+    """Drop the rebuildable reports once the date is actually done. The default; see ``--no-clean``.
+
+    "Done" is the whole job, not just the last step: every parsed row loaded, none rejected, no
+    column left for a person to answer, and the commentary delivered. Anything else and the text
+    and parse report are exactly what you would want to read next, so they stay and the run says
+    why. A verify pass (``--csv-only``) loads nothing, so it never cleans — its reports are the
+    point of it.
+    """
+    if args.skip_db:
+        log.debug("%s: nothing was loaded, keeping the run's reports.", pdf_path.name)
+        return
+    reasons = []
+    if failed_rows:
+        reasons.append(f"{failed_rows} row(s) did not load")
+    if rejected:
+        reasons.append(f"{rejected} row(s) were rejected")
+    if unsettled:
+        reasons.append(f"{unsettled} block(s) are unsettled")
+    if blank_rows:
+        reasons.append(f"{blank_rows} row(s) have no {'/'.join(CONFIRM_FIELDS)}")
+    if llmwiki_pending:
+        reasons.append("the commentary did not reach llmwiki")
+    if reasons:
+        log.info("%s: keeping %s and the parse report — %s.", pdf_path.name,
+                 paths[0].name, "; ".join(reasons))
+        return
+    gone = lr.clean_scratch(paths)
+    if gone:
+        log.info("%s: cleaned %s", pdf_path.name, ", ".join(p.name for p in gone))
 
 
 # --------------------------------------------------------------------------------------------
@@ -724,11 +909,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--review", action="store_true",
                    help="ask about every block the regexes flagged and the LLM did not settle, and "
                         "remember each answer (see --decisions)")
+    p.add_argument("--no-confirm", dest="confirm", action="store_false",
+                   help="do not ask about a Symbol/Trend the parser could not read (both are in "
+                        "the table's primary key, so such a row is rejected instead of loaded)")
     p.add_argument("--decisions", metavar="PATH",
                    help="decisions store for --review answers "
                         "(default: .pdfreader-decisions.json next to the PDF)")
     p.add_argument("--csv-only", action="store_true",
                    help="write CSV + text + reports only — no DB, no llmwiki (verify first)")
+    p.add_argument("--clean", action="store_true", default=True,
+                   help="the default: once a date has loaded completely, delete its rebuildable "
+                        "reports (<stem>.txt, <stem>.parse-report.json)")
+    p.add_argument("--no-clean", dest="clean", action="store_false",
+                   help="keep a loaded date's <stem>.txt and <stem>.parse-report.json. They are "
+                        "kept anyway whenever a row was rejected, a block is unsettled or the "
+                        "commentary did not post — that is when they are worth reading")
     p.add_argument("--skip-db", action="store_true", help="parse and write CSV only, no DB upload")
     p.add_argument("--skip-llmwiki", action="store_true", help="do not send commentary to llmwiki")
     p.add_argument("--dry-run", action="store_true", help="same as --csv-only")

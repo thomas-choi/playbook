@@ -32,8 +32,12 @@ workflow, not a library.
   numbers, and the `.repairs.json` audit log. See `docs/PDFreader.md`.
 - `hil_review.py` — the human-in-the-loop half: a decisions store keyed by a fingerprint of the
   block's text (`.pdfreader-decisions.json`, kept next to the PDFs), `apply_decisions` to replay
-  recorded answers on every later run, and the `--review` terminal prompt for the blocks neither the
-  regexes nor the LLM could settle.
+  recorded answers on every later run, the `--review` terminal prompt for the blocks neither the
+  regexes nor the LLM could settle, and the not-opt-in half: `label_missing_keys` →
+  `confirm_missing` → `record_confirmations`, which asks for the key columns the parser labelled
+  as unreadable (`Symbol`/`Trend` for the Playbook, `Symbol` for Top20) before the LLM runs, with
+  the parser's candidate pre-filled, and records the answer with the block's final rows. Off with
+  `--no-confirm`.
 - `.claude/skills/lcr-playbook-pdf/`, `.claude/skills/lcr-top20-pdf/` — the per-publication
   `SKILL.md` (how to run, how to read the reports) plus `reference/*-extraction-spec.md`, the
   document grammar and target schema. The spec file is also the system prompt the LLM repair sends,
@@ -91,7 +95,9 @@ does not propagate to the other.
   re-run to load. `--date YYYY-MM-DD` picks one date; `--replace-date` re-loads a date that is
   already in the table (DELETE + INSERT in one transaction, via `DU.ReplaceDate`); `--llm
   off|repair|force` controls the LLM repair of flagged blocks (default `repair`); `--review` asks
-  about whatever is still unsettled and records the answer so it is never asked again. Full design
+  about whatever is still unsettled and records the answer so it is never asked again; a date that
+  loads completely deletes its rebuildable `.txt`/`.parse-report.json` (`--no-clean` keeps them;
+  a verify pass never cleans). Full design
   and the defect catalogue: `docs/PDFreader.md`.
 - Batch/CLI alternative for the Playbook PDF: `python playbook_etf.py <folder> [--dry-run]`
   processes every `*Playbook YYYY-MM-DD.pdf` in the folder with the same logic as

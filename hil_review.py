@@ -7,6 +7,13 @@ it in the terminal, one block at a time, and records the answer in a decisions s
 **fingerprint of the block text** — so the same question is never asked twice, and a re-run (or a
 ``--replace-date`` reload months later) produces the same rows without a human present.
 
+One question is *not* opt-in. A row missing a column the table cannot take a NULL in (``Symbol``
+and ``Trend`` in ``ETF_Options_v1``'s primary key, ``Symbol`` in ``Stock_Options_v1``'s) cannot load
+at all, so the parsers *label* those columns where the regexes gave up and ``confirm_missing`` asks
+for them on every interactive run — before the LLM, with the parser's candidate offered as the
+Enter-default. ``record_confirmations`` writes the answers to the same store at the end of the run,
+holding each block's rows as they finally stand, so a replay reproduces what was loaded.
+
 The store lives next to the PDFs (``.pdfreader-decisions.json``) unless ``--decisions`` says
 otherwise. Because the fingerprint covers the block's text verbatim, an answer stops applying the
 moment the publisher changes that block — a new issue with different numbers is a new question.
@@ -28,7 +35,8 @@ import llm_repair as lr
 log = logging.getLogger("hil_review")
 
 STORE_NAME = ".pdfreader-decisions.json"
-ACTIONS = ("accept_llm", "keep_regex", "set_fields", "no_value", "drop_row", "unresolvable")
+ACTIONS = ("accept_llm", "keep_regex", "set_fields", "no_value", "drop_row", "add_row",
+           "unresolvable")
 
 
 # --------------------------------------------------------------------------------------------
@@ -129,6 +137,14 @@ def apply_decisions(rows: list[dict], lines: list[str], report: lr.ParseReport,
             continue
         report.replace_rows(rows, b, [dict(r) for r in d["rows"]])
         b.decision = d["action"]
+        # The recorded rows *are* the answer to whatever the parser labelled as missing, so the
+        # question is not asked again (confirm_missing runs after this).
+        for f, m in b.missing.items():
+            val = next((str(r.get(f) or "").strip() for r in d["rows"]
+                        if str(r.get(f) or "").strip()), "")
+            if val:
+                m.answer, m.answered_by = val, d.get("decided_by", "a previous run")
+        _retitle(b)   # so a replayed run's report reads WMT/Investor, like the run that asked
         applied += 1
         log.info("%s: applying recorded decision %s (%s)", b.block_id, d["action"],
                  d.get("decided_at", "?"))
@@ -339,3 +355,253 @@ def _input(prompt: str) -> str | None:
         return input(prompt)
     except EOFError:
         return None
+
+
+# --------------------------------------------------------------------------------------------
+# Missing required columns: label -> confirm -> record
+# --------------------------------------------------------------------------------------------
+def _blank_rows(rows: list[dict], block: lr.Block, field: str) -> list[int]:
+    """Indices of the block's rows with no value in ``field``."""
+    return [i for i in range(block.row_start, min(block.row_end, len(rows)))
+            if not str(rows[i].get(field) or "").strip()]
+
+
+def label_missing_keys(rows: list[dict], lines: list[str], report: lr.ParseReport,
+                       fields: list[str]) -> int:
+    """Backstop after parsing: label any blank required column the parser did not label itself.
+
+    The parser labels where it gives up, which is where the reason is known. This catches the rest
+    — a leg parsed outside any group, a replayed or repaired row with a hole — and drops labels
+    from a block that ended up with no rows at all, because there is then nothing to fill and
+    nothing to ask.
+    """
+    labelled = 0
+    for b in report.blocks:
+        if b.row_end <= b.row_start:
+            b.missing.clear()
+            continue
+        for f in fields:
+            m = b.missing.get(f)
+            if m is not None:
+                # The parser labelled it where it gave up, before the block was complete; the
+                # whole block's text may hold a candidate it could not see yet.
+                if f == "Symbol" and not m.suggest:
+                    cand = lr.ticker_candidate(b.text(lines))
+                    if cand:
+                        m.suggest, m.source = cand, f"a '@ {cand} price' in this block"
+                continue
+            blank = _blank_rows(rows, b, f)
+            if blank:
+                cand = lr.ticker_candidate(b.text(lines)) if f == "Symbol" else ""
+                b.missing[f] = lr.Missing(
+                    field=f, reason=f"{len(blank)} of this block's leg(s) have no {f}",
+                    suggest=cand, source=f"a '@ {cand} price' in this block" if cand else "")
+                labelled += 1
+    return labelled
+
+
+def reapply_answers(rows: list[dict], block: lr.Block) -> None:
+    """Put a person's confirmed values back on a block's rows after an LLM repair replaced them.
+
+    A repair returns the whole block, and the extraction spec tells the model to leave a column it
+    cannot read empty — so without this an accepted repair would quietly drop (or contradict) the
+    answer that was just given. Confirmed columns are group-wide, so they apply to every row.
+    """
+    answers = block.answers()
+    if not answers:
+        return
+    for r in rows[block.row_start:block.row_end]:
+        for f, v in answers.items():
+            r[f] = v
+
+
+def confirm_missing(rows: list[dict], lines: list[str], report: lr.ParseReport,
+                    *, source: str, fields: tuple[str, ...],
+                    choices: dict[str, tuple[str, ...]], columns: list[str],
+                    numeric_fields: tuple[str, ...], row_schema: dict) -> int:
+    """Ask a person for every labelled column nobody has answered. Returns the blocks answered.
+
+    This runs before the LLM, not after: a column the regexes could not read is usually quicker
+    for a person to confirm off the block text than it is to wait for a repair round-trip, and the
+    answer then goes to the model as given. The answers are kept on the labels and on the rows;
+    ``record_confirmations`` writes them to the decisions store at the end of the run, once repair
+    and ``--review`` have had their say, so a replay reproduces the rows that were really loaded.
+
+    Needs a terminal: with no TTY (cron, ``</dev/null``) it asks nothing and returns 0, leaving the
+    labels for the caller to report.
+    """
+    items = report.missing_blocks()
+    if not items or not sys.stdin.isatty():
+        return 0
+    cols = sorted({f for b in items for f in b.unanswered},
+                  key=lambda f: fields.index(f) if f in fields else len(fields))
+    print(f"\n{BANNER}\n{source}: {len(items)} block(s) are missing a required column "
+          f"({', '.join(cols)})\n{BANNER}")
+    answered = 0
+    for n, b in enumerate(items, start=1):
+        block_text = b.text(lines)
+        _show_missing(n, len(items), b, block_text, rows)
+        got = stop = False
+        for f in fields:
+            m = b.missing.get(f)
+            if m is None or m.answer:
+                continue
+            outcome = _answer_field(rows, lines, report, b, block_text, f, m, choices.get(f, ()),
+                                    columns, numeric_fields, row_schema)
+            if outcome == "quit":
+                stop = True
+                break
+            if outcome == "skip":
+                break
+            got = True
+        if got:
+            _retitle(b)
+            answered += 1
+        if stop:
+            print("  leaving the remaining block(s) as they are.")
+            break
+    return answered
+
+
+def record_confirmations(rows: list[dict], lines: list[str], report: lr.ParseReport,
+                         store: DecisionStore, *, publication: str, source: str,
+                         date: str) -> int:
+    """Store one decision per confirmed block, holding its rows as they finally stand.
+
+    Called after repair and ``--review``, so what is recorded is what the run actually loaded:
+    replaying it on a later run (or a ``--replace-date`` reload) reproduces those rows exactly,
+    with no LLM call and nobody present. Blocks ``--review`` already recorded are left alone —
+    its record is the final one and holds the confirmed columns too.
+    """
+    stored = 0
+    for b in report.blocks:
+        answers = b.answers()
+        if not answers or b.decision:
+            continue
+        note = ", ".join(f"{f}={v}" for f, v in answers.items()) + " confirmed by a person"
+        store.put(fingerprint(publication, b.text(lines)), "set_fields",
+                  [dict(r) for r in rows[b.row_start:b.row_end]], block=b, source=source,
+                  date=date, note=note)
+        b.decision = "set_fields"
+        stored += 1
+    return stored
+
+
+def _show_missing(n: int, total: int, b: lr.Block, block_text: str, rows: list[dict]) -> None:
+    print(f"\n[{n}/{total}] {b.block_id}"
+          + (f"   rows {b.row_start}-{b.row_end - 1}" if b.row_end > b.row_start else ""))
+    for f in b.flags:
+        print(f"  flag: {f.kind} — {f.detail}")
+    print("  --- block text " + "-" * 59)
+    for line in block_text.splitlines():
+        print(f"     {line.strip()}")
+    print("  " + "-" * 74)
+    for i in range(b.row_start, min(b.row_end, len(rows))):
+        print(f"    [{i}] {_fmt(rows[i])}")
+
+
+def _answer_field(rows: list[dict], lines: list[str], report: lr.ParseReport, b: lr.Block,
+                  block_text: str, field_name: str, m: lr.Missing, choices: tuple[str, ...],
+                  columns: list[str], numeric_fields: tuple[str, ...],
+                  row_schema: dict) -> str:
+    """Ask for one column until it is answered, skipped or the run is stopped.
+
+    Returns ``"answered"``, ``"skip"`` (this block) or ``"quit"`` (all remaining blocks).
+    """
+    print(f"  {field_name} — {m.reason}")
+    if m.suggest and m.source:
+        print(f"    candidate: {m.suggest}   (from {m.source})")
+    while True:
+        value = _ask_choice(f"  {field_name} for these rows?", choices, field_name, m.suggest,
+                            None if choices else FREE_TEXT_RE.get(field_name))
+        if value is None:
+            return "skip"
+        if value == "quit":
+            return "quit"
+        new_rows = [dict(r) for r in rows[b.row_start:b.row_end]]
+        for r in new_rows:
+            if not str(r.get(field_name) or "").strip():
+                r[field_name] = value
+        # Validate a stringified copy: the parser legitimately leaves a net Entry as a float, and
+        # the gates worth applying here are the semantic ones (symbol and numbers printed in the
+        # block, PnC, expiration shape), not the row's Python types — ``finalize`` casts later.
+        ok, reason = lr.validate_rows(_as_strings(new_rows), row_schema, block_text, columns,
+                                      numeric_fields)
+        if not ok:
+            print(f"  ! {reason}")
+            if (_input("  use it anyway? [y/N] ") or "").strip().lower() != "y":
+                print()
+                continue
+            m.reason += f" [forced past validation: {reason}]"
+        report.replace_rows(rows, b, new_rows)
+        m.answer, m.answered_by = value, _whoami()
+        print(f"  recorded: {field_name} = {value}")
+        return "answered"
+
+
+def _as_strings(rows: list[dict]) -> list[dict]:
+    """A copy with every column but ``quantity`` as a string, the shape ``ROW_SCHEMA`` describes."""
+    out = []
+    for r in rows:
+        out.append({k: (v if k == "quantity" else "" if v is None else str(v))
+                    for k, v in r.items()})
+    return out
+
+
+def _retitle(b: lr.Block) -> None:
+    """Carry the answers into the block's own identity, so the logs stop saying ``WMT/?``."""
+    answers = b.answers()
+    b.symbol = answers.get("Symbol", b.symbol)
+    b.trend = answers.get("Trend", b.trend)
+    head, sep, suffix = b.block_id.partition("#")
+    parts = head.split("/")
+    parts[0] = b.symbol or parts[0]
+    if len(parts) > 1 and b.trend:
+        parts[1] = b.trend
+    b.block_id = "/".join(parts) + (sep + suffix if sep else "")
+
+
+# A column with no fixed set of values: what a typed answer has to look like.
+FREE_TEXT_RE = {"Symbol": re.compile(r"^[A-Z]{1,6}$")}
+
+
+def _ask_choice(prompt: str, choices: tuple[str, ...], field: str, suggest: str = "",
+                pattern: re.Pattern | None = None) -> str | None:
+    """The chosen value, ``None`` to skip this block, or ``"quit"`` to stop asking.
+
+    ``suggest`` is what the page hints at without stating it: it is marked in the list and taken by
+    pressing Enter, which makes the question a confirmation rather than an open one. With no
+    suggestion, Enter skips. ``pattern`` accepts a typed value where there is no fixed list.
+    """
+    while True:
+        for i, c in enumerate(choices, start=1):
+            print(f"    [{i}] {c}" + ("   <- the page suggests this" if c == suggest else ""))
+        if pattern is not None:
+            print(f"    [type a {field.lower()}]")
+        print(("    [Enter] accept " + suggest + "      " if suggest else "    ")
+              + "[s] skip for now      [q] stop asking")
+        raw = _input(f"{prompt} > ")
+        if raw is None:
+            print(f"\n  no input available; leaving this and the remaining block(s) "
+                  f"without a {field}.")
+            return "quit"
+        raw = raw.strip()
+        if raw.lower() in ("q", "quit"):
+            return "quit"
+        if raw == "" and suggest:
+            return suggest
+        if raw.lower() in ("s", "skip", ""):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
+        match = [c for c in choices if c.lower() == raw.lower()]
+        if match:
+            return match[0]
+        if pattern is not None:
+            for candidate in (raw, raw.upper()):
+                if pattern.fullmatch(candidate):
+                    return candidate
+            print(f"  ! {field} must look like {pattern.pattern}.")
+            continue
+        print(f"  ! {field} must be one of: {', '.join(choices)} "
+              "(--review can set any other value).")
