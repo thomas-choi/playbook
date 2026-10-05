@@ -42,8 +42,9 @@ import dataUtil as DU
 import hil_review as hil
 import llm_repair as lr
 
-# "912 Playbook 2026-09-07.pdf" (Google-Drive naming) or "Playbook-2026-09-07.pdf" (repo sample)
-PDF_NAME_RE = re.compile(r"Playbook[ -](\d{4}-\d{2}-\d{2})\.pdf$", re.IGNORECASE)
+# "912 Playbook 2026-09-07.pdf" (Google-Drive naming), "Playbook-2026-09-07.pdf" (repo sample)
+# or "Playbook_2026-09-07.pdf"
+PDF_NAME_RE = re.compile(r"Playbook[ _-](\d{4}-\d{2}-\d{2})\.pdf$", re.IGNORECASE)
 # "Bond ETF Trade & Maintenance Suggestions", "Featured Trade & ...", "Featured Investor & ..."
 SECTION_RE = re.compile(r"(?:Trade|Investor)\s*&\s*Maintenance Suggestions")
 COMMENTARY_SPLIT_MARKER = "Copyright"
@@ -109,7 +110,8 @@ def find_playbook_pdfs(target: Path) -> list[tuple[str, Path]]:
     if target.is_file():
         m = PDF_NAME_RE.search(target.name)
         if not m:
-            raise ValueError(f"{target.name} is not named '*Playbook YYYY-MM-DD.pdf'")
+            raise ValueError(f"{target.name} is not named '*Playbook YYYY-MM-DD.pdf' "
+                             "(space, '-' or '_' before the date)")
         return [(m.group(1), target)]
     found = []
     for p in sorted(target.iterdir()):

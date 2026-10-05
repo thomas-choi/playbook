@@ -331,8 +331,8 @@ python playbook_etf.py FOLDER [--since YYYY-MM-DD] [--force] [--skip-db] [--skip
 ```
 
 - `FOLDER` is scanned non-recursively for filenames matching
-  `Playbook[ -](\d{4}-\d{2}-\d{2})\.pdf$` (case-insensitive) — i.e. both the Google-Drive name
-  `912 Playbook 2026-09-07.pdf` and the repo sample `Playbook-2026-09-07.pdf`. The date is taken
+  `Playbook[ _-](\d{4}-\d{2}-\d{2})\.pdf$` (case-insensitive) — i.e. the Google-Drive name
+  `912 Playbook 2026-09-07.pdf`, the repo sample `Playbook-2026-09-07.pdf` and `Playbook_2026-09-07.pdf`. The date is taken
   from the filename; this replaces the notebook's hand-edited `InputDate`.
 - PDFs are processed oldest-first. `--since` drops anything dated before the given day.
 - `--dry-run` = `--skip-db --skip-llmwiki` (parse + write the CSV and `_commentary.txt` only).

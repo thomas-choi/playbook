@@ -377,5 +377,5 @@ the same date appends duplicate rows.
   fallback "Copyright" line) wasn't found on page 2. Read `<stem>.txt` and compare against the
   markers in the script. (`LCR Top20 2020-05-18` genuinely has none.)
 - **PDF not picked up** — the filename must match `*Playbook YYYY-MM-DD.pdf` /
-  `*Top20 YYYY-MM-DD.pdf` (case-insensitive, space or `-` before the date).
+  `*Top20 YYYY-MM-DD.pdf` (case-insensitive, space or `-` before the date; Playbook also accepts `_`).
 - **Date skipped** — it's already in the target table; use `--replace-date` to re-load it.

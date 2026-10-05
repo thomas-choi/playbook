@@ -5,6 +5,18 @@ repository, per the project's mandatory change-logging rule. Newest entries at t
 
 ---
 
+## 2026-10-04 — `playbook_etf.py` accepts `*Playbook_YYYY-MM-DD.pdf`
+
+- **Goal:** Let the batch script pick up Playbook PDFs named with an underscore before the date
+  (`Playbook_2026-09-07.pdf`), alongside the existing space and `-` forms.
+- **Implementation detail:** `PDF_NAME_RE` changed from `Playbook[ -](...)` to
+  `Playbook[ _-](...)`; the single-file error message names the accepted separators. The date is
+  still taken from the filename, so nothing downstream changes.
+- **Related files:** `playbook_etf.py`, `README.md`, `docs/Design-Plan.md`, `docs/HISTORY.md`.
+- **Test coverage:** No test suite in the repo. Checked `PDF_NAME_RE` by hand against
+  `912 Playbook 2026-09-07.pdf`, `Playbook-2026-09-07.pdf`, `Playbook_2026-09-07.pdf` (all match,
+  date `2026-09-07`) and `Playbook2026-09-07.pdf` (no match).
+
 ## 2026-09-12 — Add `Top20_2_Code.ipynb` and `top20_stock.py` (Top20 commentary → llmwiki, batch CLI)
 
 - **Goal:** Give the Top20 pipeline the same two upgrades the Playbook pipeline got: capture the
