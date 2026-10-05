@@ -233,3 +233,60 @@ def get_Last_Date_by_Sym(tblname, sym):
     if mktdate is not None:
         lastdt = mktdate + timedelta(days=1)
     return lastdt
+def _insert_rows(conn, eoddata, DBn, TBLn):
+    """Append ``eoddata`` on an open connection, falling back to row-by-row on failure.
+
+    One unloadable row (a NOT NULL column that parsed empty, a duplicate primary key) used to cost
+    the whole DataFrame, because ``to_sql`` sends it as one statement. Each attempt runs in its own
+    savepoint so a rejected row leaves the rest of the batch intact.
+    Returns ``(inserted, [(index, error), ...])``.
+    """
+    sp = conn.begin_nested()
+    try:
+        eoddata.to_sql(name=TBLn, con=conn, schema=DBn, if_exists='append', index=False)
+        sp.commit()
+        return len(eoddata), []
+    except Exception as e:
+        sp.rollback()
+        logging.warning(f'bulk insert into {DBn}.{TBLn} failed '
+                        f'({str(getattr(e, "orig", e)).splitlines()[0]}); '
+                        f'retrying {len(eoddata)} row(s) one by one.')
+    inserted, failed = 0, []
+    for idx in eoddata.index:
+        sp = conn.begin_nested()
+        try:
+            eoddata.loc[[idx]].to_sql(name=TBLn, con=conn, schema=DBn, if_exists='append',
+                                      index=False)
+            sp.commit()
+            inserted += 1
+        except Exception as e:
+            sp.rollback()
+            # e is a SQLAlchemy wrapper whose first line is the whole INSERT; e.orig is the
+            # driver error that says what is actually wrong with the row.
+            failed.append((idx, str(getattr(e, "orig", e)).splitlines()[0]))
+    return inserted, failed
+
+
+def StoreEOD_strict(eoddata, DBn, TBLn):
+    """Like ``StoreEOD``, but reports what did not load instead of swallowing the exception.
+
+    Returns ``(inserted, [(index, error), ...])``; raises only if the connection itself fails.
+    """
+    logging.info(f'StoreEOD_strict size: {len(eoddata)} in table:{TBLn} on DB:{DBn}')
+    with get_DBengine().begin() as conn:
+        return _insert_rows(conn, eoddata, DBn, TBLn)
+
+
+def ReplaceDate(eoddata, DBn, TBLn, datevalue, datecol="Date"):
+    """Replace one date's rows: ``DELETE WHERE <datecol>=date`` then insert, in one transaction.
+
+    This is what makes re-processing an already-loaded date idempotent — a plain append hits the
+    tables' primary keys. Returns ``(deleted, inserted, [(index, error), ...])``.
+    """
+    from sqlalchemy import text
+    logging.info(f'ReplaceDate {datevalue} in {DBn}.{TBLn} with {len(eoddata)} row(s)')
+    with get_DBengine().begin() as conn:
+        deleted = conn.execute(text(f'DELETE FROM {DBn}.{TBLn} WHERE {datecol} = :d'),
+                               {"d": datevalue}).rowcount
+        inserted, failed = _insert_rows(conn, eoddata, DBn, TBLn)
+    return deleted, inserted, failed

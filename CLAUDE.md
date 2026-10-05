@@ -21,11 +21,23 @@ workflow, not a library.
 - `Top20_2_Code.ipynb` — v2 of the above: same parsing (written with `df.loc` so it works on
   pandas >= 2), plus the printed-page-1 market commentary captured and sent to llmwiki.
 - `top20_stock.py` — CLI version of `Top20_2_Code.ipynb`, same shape as `playbook_etf.py`:
-  scans a folder of `*Top20 YYYY-MM-DD.pdf`, loads rows to `Trading.Stock_Options` (skipping
+  scans a folder of `*Top20 YYYY-MM-DD.pdf`, loads rows to `Trading.Stock_Options_v1` (skipping
   already-loaded dates) and posts the commentary to llmwiki.
 - `playbook_etf.py` — CLI version of `ETF_2_Code.ipynb`: scans a folder of Playbook PDFs, loads
   rows to `Trading.ETF_Options_v1` (skipping already-loaded dates) and sends the page-2 market
   commentary to llmwiki.
+- `llm_repair.py` — shared by both CLI scripts: the `ParseReport` the parsers record their flagged
+  blocks in, an OpenAI-standard LLM client (`LLM_BASE_URL`/`LLM_MODEL`, any compatible endpoint
+  including a local ollama/vLLM), `repair_block`, the `validate_rows` gate that rejects invented
+  numbers, and the `.repairs.json` audit log. See `docs/PDFreader.md`.
+- `hil_review.py` — the human-in-the-loop half: a decisions store keyed by a fingerprint of the
+  block's text (`.pdfreader-decisions.json`, kept next to the PDFs), `apply_decisions` to replay
+  recorded answers on every later run, and the `--review` terminal prompt for the blocks neither the
+  regexes nor the LLM could settle.
+- `.claude/skills/lcr-playbook-pdf/`, `.claude/skills/lcr-top20-pdf/` — the per-publication
+  `SKILL.md` (how to run, how to read the reports) plus `reference/*-extraction-spec.md`, the
+  document grammar and target schema. The spec file is also the system prompt the LLM repair sends,
+  so it is the single source of truth for what a row means — update it with the parser.
 - `dataUtil.py` — `DU` module imported by both notebooks: builds the SQLAlchemy/PyMySQL engine
   from env vars, and provides `load_df`, `load_eod_price`, `load_symbols`, `StoreEOD`, etc. for
   reading/writing the market-data and options tables.
@@ -69,18 +81,24 @@ does not propagate to the other.
 
 ## Environment / running
 
-- The checked-in `.venv` is **Python 3.8** (see `.venv/pyvenv.cfg`), not the 3.11+ called for in
-  global conventions — match whatever the notebook kernel is actually using rather than assuming
-  a newer interpreter.
+- The checked-in `.venv` is **Python 3.11.17** with pandas 3.0 (rebuilt since the 3.8 one the
+  notebooks were written against) — run everything with `.venv/bin/python`.
 - Install deps: `pip install -r requirements.txt` (pandas, numpy, pdfplumber, PyMuPDF, notebook,
   python-dotenv, PyMySQL, SQLAlchemy).
 - Run via Jupyter: `jupyter notebook` (or open in VS Code) and execute cells top-to-bottom.
+- The CLI scripts take **a single PDF or a folder**, and the safe sequence is always
+  `--csv-only` (CSV + extracted text + parse/repair reports, no DB, no llmwiki) → inspect →
+  re-run to load. `--date YYYY-MM-DD` picks one date; `--replace-date` re-loads a date that is
+  already in the table (DELETE + INSERT in one transaction, via `DU.ReplaceDate`); `--llm
+  off|repair|force` controls the LLM repair of flagged blocks (default `repair`); `--review` asks
+  about whatever is still unsettled and records the answer so it is never asked again. Full design
+  and the defect catalogue: `docs/PDFreader.md`.
 - Batch/CLI alternative for the Playbook PDF: `python playbook_etf.py <folder> [--dry-run]`
   processes every `*Playbook YYYY-MM-DD.pdf` in the folder with the same logic as
   `ETF_2_Code.ipynb` (one function per notebook stage), skips dates already in
   `Trading.ETF_Options_v1`, and posts the page-2 market commentary to llmwiki `/ingest`. Design
   and options are in `docs/Design-Plan.md` → "Batch script". `python top20_stock.py <folder>
-  [--dry-run]` does the same for `*Top20 YYYY-MM-DD.pdf` → `Trading.Stock_Options` (table name
+  [--dry-run]` does the same for `*Top20 YYYY-MM-DD.pdf` → `Trading.Stock_Options_v1` (table name
   from `TBLSTOCKOPTIONS`).
 - Source PDFs are read from a Google-Drive path mounted in WSL (`/mnt/i/My Drive/...`) — that
   mount and the specific dated PDF filename must exist locally before the first cell will run.

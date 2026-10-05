@@ -12,3 +12,8 @@ SQLAlchemy
 pytz
 # HTTP client for the llmwiki /upload call (ETF_2_Code.ipynb, Feature A)
 requests
+# JSON-schema validation of LLM-repaired rows (llm_repair.py)
+jsonschema
+# OpenAI-standard client for the LLM repair pass (llm_repair.py); works against any compatible
+# endpoint, including a local ollama / vLLM server
+openai
