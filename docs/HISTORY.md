@@ -5,6 +5,26 @@ repository, per the project's mandatory change-logging rule. Newest entries at t
 
 ---
 
+## 2026-10-19 — Fix `Top20_2_Code.ipynb` producing an empty Stock_Options frame
+
+- **Goal:** `Top20_2_Code.ipynb` stopped producing stock-option rows (the CSV was empty and
+  `StoreEOD size: 0`), while the commentary → llmwiki step still worked.
+- **Root cause:** In an uncommitted edit, the per-stock parsing cell (`for line in iterates:`, the
+  logic from `Top20-Ubuntu.ipynb`) had been switched from a code cell to a **Markdown** cell, so it
+  never ran. `df` kept only its blank seed row, `df[:-1]` dropped that row, and every later cell
+  worked on an empty frame. The parsing logic itself was intact (the same as `Top20-Ubuntu.ipynb`,
+  apart from the `df.loc` writes needed on pandas 3).
+- **Implementation detail:** Changed the cell back to a code cell, without moving it. Also made two
+  matches tolerant of PDF typos, which affected CPRT in the 2026-10-19 issue (the original notebook
+  has the same flaws): the Status regex `\S*` → `\S+`, so a status line that starts with a space no
+  longer gives `''`, and the marker `"Target @ "` → `"Target @"`, so `Target @22.00` is parsed.
+  `top20_stock.py` already handled the second case.
+- **Related files:** `Top20_2_Code.ipynb`, `docs/HISTORY.md`.
+- **Test coverage:** The repo has no test suite. Ran the notebook's DataFrame-setup, parse and sign
+  cells against `912 Top20 2026-10-19.pdf`: 20 rows, all with Symbol/Status/Expiration/PnC/
+  Strike/Entry/Target/Stop filled in (CPRT before the fix: blank Status and Target). No tests
+  added or removed. Not exercised: the DB load.
+
 ## 2026-10-04 — `playbook_etf.py` accepts `*Playbook_YYYY-MM-DD.pdf`
 
 - **Goal:** Let the batch script pick up Playbook PDFs named with an underscore before the date
