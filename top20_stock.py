@@ -54,6 +54,9 @@ OUTPUT_COLUMNS = ["Date", "Symbol", "Status", "Expiration", "PnC", "Strike", "En
                   "Entry2", "Target_Sign", "Target", "Stop_Sign", "Stop"]
 # NOT NULL in Trading.Stock_Options_v1, and its primary key.
 KEY_COLUMNS = ["Date", "Symbol"]
+# Column dtypes of the DB frame (``finalize``); also how db_patch.py types a hand-typed cell.
+DB_TYPES = {"Strike": "float", "Entry1": "float", "Entry2": "float", "Target": "float",
+            "Stop": "float"}
 # The key column a person can supply (Date comes from the filename). No fixed choices: the answer
 # is a ticker, typed or accepted from the candidate the parser found.
 CONFIRM_FIELDS = ("Symbol",)
@@ -460,8 +463,7 @@ def finalize(df: pd.DataFrame, date_str: str) -> tuple[pd.DataFrame, pd.DataFram
     db_df = csv_df.replace(r"^\s*$", np.nan, regex=True)
     db_df["Date"] = pd.to_datetime(db_df["Date"], format="%Y-%m-%d")
     db_df["Expiration"] = db_df["Expiration"].map(_parse_expiration)
-    db_df = db_df.astype({"Strike": "float", "Entry1": "float", "Entry2": "float",
-                          "Target": "float", "Stop": "float"})
+    db_df = db_df.astype(DB_TYPES)
     return csv_df, db_df
 
 
@@ -531,6 +533,9 @@ def store(db_df: pd.DataFrame, db: str, table: str, date_str: str, replace: bool
         log.info("Replacing %s in %s.%s with %d rows", date_str, db, table, len(db_df))
         deleted, inserted, failed = DU.ReplaceDate(db_df, db, table, date_str)
         log.info("%s: deleted %d existing row(s), inserted %d", date_str, deleted, inserted)
+        log.warning("%s: hand corrections made with db_patch.py are gone for this date; re-apply "
+                    "them: db_patch.py <corrections> --table stock --date %s --apply",
+                    date_str, date_str)
     else:
         log.info("Appending %d rows to %s.%s", len(db_df), db, table)
         inserted, failed = DU.StoreEOD_strict(db_df, db, table)

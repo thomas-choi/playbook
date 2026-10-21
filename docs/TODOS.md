@@ -24,6 +24,9 @@ when a task lands.
       `--decisions`: a terminal prompt per unsettled block, answers fingerprinted on the block text
       and replayed on every later run. Primary-key collisions are now flagged for review
       (`flag_duplicate_legs` / `flag_duplicate_symbols`) instead of being dropped at load time.
+- [x] **Correct rows and add missing rows by hand.** `db_patch.py` (patch CSV → dry-run diff →
+      `--apply` in one transaction, idempotent, audited) for `ETF_Options_v1` and
+      `Stock_Options_v1`; tests in `tests/unit/test_db_patch.py`.
 - [ ] **Answer the 8 open review items.** `--csv-only --review` over each archive:
       4 Playbook blocks (the 2016-boilerplate IWM/SPY/QQQ collisions in 2020-06-01 and 2020-06-22),
       `912 Playbook 2026-08-24` EFA (`@ EFA Stop`, no price in the PDF — answer `[4] not in the PDF`),

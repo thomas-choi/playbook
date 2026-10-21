@@ -9,7 +9,7 @@ trade-suggestion tables (symbol, strike, entry/target/stop prices, etc.) and loa
 MySQL database. The whole pipeline lives in two Jupyter notebooks; `dataUtil.py` is the only
 shared Python module (DB access + symbol-list loading).
 
-There is no package/app code, no test suite, and no build step — this is an analyst's notebook
+There is no package/app code and no build step; the only tests are `tests/unit/` (see below) — this is an analyst's notebook
 workflow, not a library.
 
 ## Repository layout
@@ -42,6 +42,17 @@ workflow, not a library.
   `SKILL.md` (how to run, how to read the reports) plus `reference/*-extraction-spec.md`, the
   document grammar and target schema. The spec file is also the system prompt the LLM repair sends,
   so it is the single source of truth for what a row means — update it with the parser.
+- `db_patch.py` — hand corrections to the two `_v1` tables: a patch CSV of `update`/`insert`/
+  `delete` rows keyed by the primary key, dry-run diff by default, `--apply` in one transaction
+  (`DU.ApplyPatch`), idempotent so it can be re-applied after a `--replace-date` reload, audited to
+  `<patch>.applied.json`. Uses the loaders' `OUTPUT_COLUMNS`/`KEY_COLUMNS`/`DB_TYPES`/
+  `split_loadable`. See `docs/PDFreader.md` → "Hand corrections".
+- `tests/` — pytest unit tests (`.venv/bin/python -m pytest tests/unit/`). There are no real DB calls:
+  `tests/conftest.py`'s `db` fixture is an in-memory SQLite copy of both tables' live DDL.
+  `tests/unit/test_db_patch.py` covers `db_patch.py`, `DU.ApplyPatch` and the loaders'
+  `--replace-date` re-apply warning.
+  `tests/unit/test_dataUtil.py` checks that `get_DBengine` logs the password masked
+  (`DU.mask_secret`: `xxxx` + last 4).
 - `dataUtil.py` — `DU` module imported by both notebooks: builds the SQLAlchemy/PyMySQL engine
   from env vars, and provides `load_df`, `load_eod_price`, `load_symbols`, `StoreEOD`, etc. for
   reading/writing the market-data and options tables.

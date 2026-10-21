@@ -5,6 +5,126 @@ repository, per the project's mandatory change-logging rule. Newest entries at t
 
 ---
 
+## 2026-10-20 — Stop tracking `.claude/`
+
+- **Goal:** Have git ignore everything under `.claude/`.
+- **Root cause:** `.claude/` was already in `.gitignore`, but ignore rules do not apply to files
+  git already tracks. `.claude/skills/lcr-playbook-pdf/SKILL.md` and
+  `.claude/skills/lcr-top20-pdf/SKILL.md` were committed before the rule was added.
+- **Implementation detail:** Ran `git rm -r --cached .claude/`. The files stay on disk, and the next
+  commit removes them from the repository. `llm_repair.spec_path` still reads the extraction spec
+  from `.claude/skills/lcr-<name>-pdf/reference/`, so a fresh clone has no spec unless
+  `LLM_SPEC_<NAME>` points to one. It then falls back to a minimal instruction.
+- **Related files:** `.gitignore` (unchanged; `.claude/` was already listed), `docs/HISTORY.md`.
+- **Test coverage:** No code changed, so no unit tests changed. Checked that `git status` shows both
+  files as deleted from the index and that they are still on disk.
+
+## 2026-10-20 — `.gitignore`: make the dated-CSV pattern match real dates
+
+- **Goal:** Stop dated CSVs such as `912 Playbook 2026-10-19.csv` from being picked up as untracked.
+- **Root cause:** `.gitignore` uses glob patterns, not regexes, so `*YYYY-MM-DD*.csv` only matched
+  the literal letters `YYYY-MM-DD`.
+- **Implementation detail:** The pattern is now `*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.csv`.
+  This also ignores patch CSVs such as `ETF_2026-10-19.csv`.
+- **Related files:** `.gitignore`, `docs/HISTORY.md`.
+- **Test coverage:** No code changed, so no unit tests changed. Checked with `git check-ignore -v`:
+  both dated CSVs are ignored, and `requirements.txt` and `ETF_2026-10-19.applied.json` are not.
+
+## 2026-10-20 — `db_patch.py`: delete + insert of one key replaces the row; strip Excel's `'`
+
+- **Goal:** Allow `ETF_2026-10-19.csv`, which deletes two SPCX rows and inserts them again with
+  `Expiration` 2027-04-16. It failed with `duplicate primary key` on lines 4 and 5.
+- **Root cause:**
+  - `parse_patch` ran the loaders' duplicate-key check over all rows whatever their `Action`, so a
+    delete and an insert of the same key counted as a duplicate.
+  - Past that check, `plan()` would also have rejected the inserts ("a different row is already
+    there"), because it did not know the same patch deletes those rows first.
+  - The CSV's `Low-High` cells were saved from Excel as `'-110P`. That apostrophe became part of
+    the key, so the deletes matched no row.
+- **Implementation detail:**
+  - The duplicate check now runs on the delete rows and the other rows separately. An `update` of
+    a key the patch also deletes is still a `duplicate primary key`.
+  - `plan()` treats a delete + insert of one key as a replace: both are applied, or both are
+    no-ops once the row already equals the insert. The dry run shows `(replaces row)` with the
+    columns that change. The insert row is built by the new helper `insert_row`.
+  - `typed()` strips a leading `'` from every cell. The fix uses `startswith`, not
+    `str.removeprefix`, because `.venv` is Python 3.8.
+- **Related files:** `db_patch.py`, `tests/unit/test_db_patch.py`, `docs/PDFreader.md`,
+  `docs/HISTORY.md`.
+- **Test coverage:**
+  - Added `test_delete_then_insert_same_key_replaces_row`: an ETF Expiration fix with `'`-prefixed
+    `Low-High`. It applies, and re-applying it is a no-op.
+  - Added `test_parse_rejects_two_inserts_of_one_key`.
+  - All 33 unit tests pass. No tests removed.
+
+## 2026-10-20 — Mask the DB password in `dataUtil.get_DBengine`'s log line
+
+- **Goal:** Stop the MySQL password from being written to the logs in full.
+- **Root cause:** `get_DBengine()` logged the whole connection URL, password included, at INFO
+  level. Every CLI script turns INFO on, so each run printed the password.
+- **Implementation detail:**
+  - New `DU.mask_secret()` returns `xxxx` plus the last 4 characters. A secret of 4 characters or
+    fewer becomes plain `xxxx`.
+  - The log line now uses a URL built with the masked password. The engine still gets the real one.
+  - The second log line (`dbconn=>Engine(...)`) was already masked by SQLAlchemy (`***`).
+- **Related files:** `dataUtil.py`, `tests/unit/test_dataUtil.py`, `CLAUDE.md`, `docs/HISTORY.md`.
+- **Test coverage:**
+  - Added `tests/unit/test_dataUtil.py`, 6 cases:
+    - `mask_secret` with a long secret, a 5-character secret, a 4-character secret, an empty
+      secret and `None`.
+    - `get_DBengine` logs the masked URL and never the password, with `create_engine` stubbed.
+  - All 31 unit tests pass. No tests removed.
+
+## 2026-10-20 — `db_patch.py`: hand corrections and missing rows for the `_v1` tables
+
+- **Goal:** Correct specific cells of rows already in `Trading.ETF_Options_v1` /
+  `Trading.Stock_Options_v1`, and add rows a loaded date is missing, without rebuilding the whole
+  date from its PDF (`--replace-date` was the only way to change loaded data).
+- **Implementation detail:**
+  - New `db_patch.py <patch.csv|folder> --table etf|stock [--date D] [--apply]`. A patch CSV holds
+    `update`/`insert`/`delete` rows keyed by the table's primary key; a row with a blank `Action`
+    is skipped. It is a dry-run diff by default.
+  - Before anything is written, it validates columns, types, `Trend`/sign/`PnC` values, NULL or
+    duplicate keys (via the loaders' `split_loadable`), updates of missing rows, and inserts over a
+    different existing row.
+  - An ETF insert with a blank `Low-High` gets it built as `derive_columns` does. Blank signs come
+    from `PnC`, and a blank `quantity` becomes 1. Updating the key parts `L_Strike`/`H_Strike`/`PnC`
+    is refused.
+  - It is idempotent, so it can be re-applied after a reload. Each apply appends the before and
+    after rows to `<patch>.applied.json`.
+  - New `DU.ApplyPatch`: deletes, updates and inserts in one transaction, rolled back on any error.
+  - The two loaders' inline `astype` dicts moved to module constants `DB_TYPES`, so `db_patch.py`
+    types cells the same way, and their `store()` replace path now warns that `db_patch.py`
+    corrections for the date must be re-applied.
+  - `pytest` was added to `requirements.txt`.
+- **Related files:** `db_patch.py`, `dataUtil.py`, `playbook_etf.py`, `top20_stock.py`,
+  `requirements.txt`, `tests/conftest.py`, `tests/unit/test_db_patch.py`, `CLAUDE.md`,
+  `docs/PDFreader.md`, `docs/TODOS.md`, `.claude/skills/lcr-playbook-pdf/SKILL.md`,
+  `.claude/skills/lcr-top20-pdf/SKILL.md`, `docs/HISTORY.md`.
+- **Test coverage:**
+  - Added the repo's first unit tests, `tests/unit/test_db_patch.py`: 25 cases on an in-memory
+    SQLite copy of the live DDL, all passing.
+    - Parsing both tables, typing, and the `--date` filter.
+    - 10 rejection cases: unknown column, missing key column, bad number, bad Trend, bad sign,
+      key-part update, NULL key, duplicate key, bad action, empty update.
+    - Derived `Low-High`/signs/`quantity` on insert.
+    - Rows with a blank `Action` are skipped.
+    - Missing-row and conflicting-insert errors.
+    - Dry run writes nothing.
+    - Only the targeted cells change, and `NULL` clears a cell.
+    - Idempotent re-apply.
+    - A conflict applies nothing.
+    - `ApplyPatch` rollback on a DB error.
+    - Audit before/after.
+    - Folder plus `--date`.
+    - The `--replace-date` warning in both loaders.
+  - No tests removed.
+  - Regression: `--csv-only --llm off` CSVs for `LCR Playbook 2022-11-21` and `LCR Top20 2022-06-21`
+    are byte-identical before and after the change.
+  - Live: a dry run against MySQL 8.4 for 2026-10-19 matched the rows; `--apply` was run on
+    `CREATE TABLE … LIKE` copies, changed exactly the targeted cells, and a second apply reported 0
+    changes. The copies were dropped, and the live rows were not written.
+
 ## 2026-10-19 — Fix `Top20_2_Code.ipynb` producing an empty Stock_Options frame
 
 - **Goal:** `Top20_2_Code.ipynb` stopped producing stock-option rows (the CSV was empty and

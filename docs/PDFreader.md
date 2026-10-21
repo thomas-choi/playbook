@@ -427,6 +427,41 @@ The file is small, sorted and meant to be edited by hand:
   re-processing an already-loaded date idempotent. `DU.StoreEOD` and `DU.ExecSQL` are untouched (the
   notebooks still use them; note `ExecSQL`'s `engine.execute` is dead under SQLAlchemy 2).
 
+## Hand corrections (`db_patch.py`)
+
+The loaders can only rebuild a whole date from its PDF. `db_patch.py` takes a patch CSV
+(`Action` = `update`/`insert`/`delete`, the table's key columns, plus any other table columns) and
+applies it to one table, `--table etf|stock`. A row with a blank `Action` is skipped (a note or a
+draft line), and logged as skipped.
+
+- **Dry run by default.** It reads the patch's dates from the table and prints a diff. `--apply`
+  writes through `DU.ApplyPatch()`: deletes, then updates (only the changed cells, backtick-quoted
+  columns), then inserts, all in one transaction. Any error rolls the whole file back, which is
+  deliberately unlike `StoreEOD_strict`'s per-row savepoints.
+- **Validated before anything is written.** The checks are:
+  - Every column belongs to the table.
+  - Dates are `YYYY-MM-DD`, or `M/D/YY` for `Expiration`.
+  - Numbers are typed with the loaders' `DB_TYPES`.
+  - `Trend` is in `TREND_VALUES`, signs are `<`/`>` and `PnC` is `P`/`C`.
+  - The file has no NULL key and no key twice. These two checks are the loaders' own `split_loadable`.
+    The one exception is one `delete` plus one `insert` of the same key, which replaces that row
+    (for example, to fix a non-key column such as `Expiration`). A replace whose insert already
+    matches the row is a no-op on re-apply.
+  - A leading `'` (Excel's text marker, as in `'+78P-75P`) is stripped from every cell.
+  - An `update` names a row that exists.
+  - An `insert` does not land on a *different* existing row.
+- **ETF keys.** An insert with a blank `Low-High` gets it built the way `derive_columns` does, so
+  `L_Strike`/`H_Strike`/`PnC` cannot be updated in place: delete the old row and insert the new one.
+  A blank sign on an insert comes from `PnC`, and a blank `quantity` becomes 1.
+- **Idempotent.** A cell that already has its value, a row that is already there, and a delete of a
+  missing row are all no-ops. That is how corrections come back after a `--replace-date` reload,
+  which drops them and logs a warning saying how to re-apply them. Keep the patch CSVs (for example,
+  `corrections/` next to the PDFs).
+- **Audited.** Each apply appends to `<patch>.applied.json`: the time, the user, the counts, and the
+  before and after image of every touched row.
+
+Tests: `tests/unit/test_db_patch.py` (27 cases, in-memory SQLite with the live DDL; `pytest tests/unit/`).
+
 ## Running it
 
 ```bash
@@ -513,6 +548,12 @@ any of this, by design.
   person confirmed as `Investor` is accepted and `reapply_answers` restores `Investor`.
 - DB layer, on a `CREATE TABLE … LIKE` copy: `ReplaceDate` run twice leaves the same row count; a
   batch of 3 rows with one NULL-key row inserts 2 and reports 1 with the driver's own message.
+- `db_patch.py`, against MySQL 8.4. A dry run on 2026-10-19 showed a diff that matched the rows
+  `SELECT`ed by hand. Then `--apply` went to `CREATE TABLE … LIKE` copies holding that date (for
+  Stock: an update, a no-op update and an insert. ETF: an update and an insert with a blank
+  `Low-High`). Diffing the copy against the live table showed exactly the targeted
+  cell changed plus the new row. A second `--apply` reported `0 change(s)`. The copies were dropped,
+  and the live rows were never written.
 - The three dates that had never loaded are in: `ETF_Options_v1` 2022-06-06 = 52 rows,
   `Stock_Options_v1` 2020-05-18 = 20 rows and 2022-12-19 = 19 rows (the 20th is the ticker-less Uber
   row, held back in `.rejected.csv` until a repair supplies the symbol).

@@ -57,6 +57,9 @@ OUTPUT_COLUMNS = ["Date", "Type", "Trend", "Symbol", "Status", "Expiration", "Pn
                   "Stop_Sign", "Stop", "quantity"]
 # NOT NULL in Trading.ETF_Options_v1, and its primary key.
 KEY_COLUMNS = ["Date", "Trend", "Symbol", "Low-High"]
+# Column dtypes of the DB frame (``finalize``); also how db_patch.py types a hand-typed cell.
+DB_TYPES = {"L_Strike": "float", "H_Strike": "float", "Target": "float", "Entry": "float",
+            "Stop": "float", "quantity": "int"}
 NUMERIC_FIELDS = ("L_Strike", "H_Strike", "Entry", "Target", "Stop")
 
 NUM_RE = r"\d+(\.)?\d+"          # strike matcher (needs >= 2 digits), kept as in the notebook
@@ -671,8 +674,7 @@ def finalize(df: pd.DataFrame, date_str: str) -> tuple[pd.DataFrame, pd.DataFram
     db_df = csv_df.replace(r"^\s*$", np.nan, regex=True)
     db_df["Date"] = pd.to_datetime(db_df["Date"], format="%Y-%m-%d")
     db_df["Expiration"] = db_df["Expiration"].map(_parse_expiration)
-    db_df = db_df.astype({"L_Strike": "float", "H_Strike": "float", "Target": "float",
-                          "Entry": "float", "Stop": "float", "quantity": "int"})
+    db_df = db_df.astype(DB_TYPES)
     return csv_df, db_df
 
 
@@ -744,6 +746,9 @@ def store(db_df: pd.DataFrame, db: str, table: str, date_str: str, replace: bool
         log.info("Replacing %s in %s.%s with %d rows", date_str, db, table, len(db_df))
         deleted, inserted, failed = DU.ReplaceDate(db_df, db, table, date_str)
         log.info("%s: deleted %d existing row(s), inserted %d", date_str, deleted, inserted)
+        log.warning("%s: hand corrections made with db_patch.py are gone for this date; re-apply "
+                    "them: db_patch.py <corrections> --table etf --date %s --apply",
+                    date_str, date_str)
     else:
         log.info("Appending %d rows to %s.%s", len(db_df), db, table)
         inserted, failed = DU.StoreEOD_strict(db_df, db, table)

@@ -17,3 +17,5 @@ jsonschema
 # OpenAI-standard client for the LLM repair pass (llm_repair.py); works against any compatible
 # endpoint, including a local ollama / vLLM server
 openai
+# unit tests (tests/unit/, run with `pytest tests/unit/`)
+pytest
