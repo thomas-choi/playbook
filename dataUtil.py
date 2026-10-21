@@ -29,6 +29,12 @@ def get_Symbollist(listname):
     s_list = pd.read_csv(listpath)['Symbol'].unique()
     return s_list
 
+def mask_secret(secret):
+    """``'xxxx'`` plus the secret's last 4 characters, for logs; a secret of 4 or fewer is all ``'xxxx'``."""
+    if not secret:
+        return secret
+    return "xxxx" + (secret[-4:] if len(secret) > 4 else "")
+
 def get_DBengine():
     global dbconn
     if dbconn is None:
@@ -39,7 +45,8 @@ def get_DBengine():
         DBPORT = environ.get("DBPORT")
 
         dbpath = "mysql+pymysql://{user}:{pw}@{host}:{port}/{db}".format(host=hostname, db=DB, user=uname, pw=pwd,port=DBPORT)
-        logging.info(f'setup DBengine to {dbpath}')
+        logpath = "mysql+pymysql://{user}:{pw}@{host}:{port}/{db}".format(host=hostname, db=DB, user=uname, pw=mask_secret(pwd),port=DBPORT)
+        logging.info(f'setup DBengine to {logpath}')
         # Create SQLAlchemy engine to connect to MySQL Database
         dbconn = create_engine(dbpath)
         logging.info(f'dbconn=>{dbconn}')
@@ -233,3 +240,97 @@ def get_Last_Date_by_Sym(tblname, sym):
     if mktdate is not None:
         lastdt = mktdate + timedelta(days=1)
     return lastdt
+def _insert_rows(conn, eoddata, DBn, TBLn):
+    """Append ``eoddata`` on an open connection, falling back to row-by-row on failure.
+
+    One unloadable row (a NOT NULL column that parsed empty, a duplicate primary key) used to cost
+    the whole DataFrame, because ``to_sql`` sends it as one statement. Each attempt runs in its own
+    savepoint so a rejected row leaves the rest of the batch intact.
+    Returns ``(inserted, [(index, error), ...])``.
+    """
+    sp = conn.begin_nested()
+    try:
+        eoddata.to_sql(name=TBLn, con=conn, schema=DBn, if_exists='append', index=False)
+        sp.commit()
+        return len(eoddata), []
+    except Exception as e:
+        sp.rollback()
+        logging.warning(f'bulk insert into {DBn}.{TBLn} failed '
+                        f'({str(getattr(e, "orig", e)).splitlines()[0]}); '
+                        f'retrying {len(eoddata)} row(s) one by one.')
+    inserted, failed = 0, []
+    for idx in eoddata.index:
+        sp = conn.begin_nested()
+        try:
+            eoddata.loc[[idx]].to_sql(name=TBLn, con=conn, schema=DBn, if_exists='append',
+                                      index=False)
+            sp.commit()
+            inserted += 1
+        except Exception as e:
+            sp.rollback()
+            # e is a SQLAlchemy wrapper whose first line is the whole INSERT; e.orig is the
+            # driver error that says what is actually wrong with the row.
+            failed.append((idx, str(getattr(e, "orig", e)).splitlines()[0]))
+    return inserted, failed
+
+
+def StoreEOD_strict(eoddata, DBn, TBLn):
+    """Like ``StoreEOD``, but reports what did not load instead of swallowing the exception.
+
+    Returns ``(inserted, [(index, error), ...])``; raises only if the connection itself fails.
+    """
+    logging.info(f'StoreEOD_strict size: {len(eoddata)} in table:{TBLn} on DB:{DBn}')
+    with get_DBengine().begin() as conn:
+        return _insert_rows(conn, eoddata, DBn, TBLn)
+
+
+def ReplaceDate(eoddata, DBn, TBLn, datevalue, datecol="Date"):
+    """Replace one date's rows: ``DELETE WHERE <datecol>=date`` then insert, in one transaction.
+
+    This is what makes re-processing an already-loaded date idempotent — a plain append hits the
+    tables' primary keys. Returns ``(deleted, inserted, [(index, error), ...])``.
+    """
+    from sqlalchemy import text
+    logging.info(f'ReplaceDate {datevalue} in {DBn}.{TBLn} with {len(eoddata)} row(s)')
+    with get_DBengine().begin() as conn:
+        deleted = conn.execute(text(f'DELETE FROM {DBn}.{TBLn} WHERE {datecol} = :d'),
+                               {"d": datevalue}).rowcount
+        inserted, failed = _insert_rows(conn, eoddata, DBn, TBLn)
+    return deleted, inserted, failed
+
+
+def _where(key):
+    """``"`a` = :k0 AND `b` = :k1"`` plus its params, for one primary-key dict."""
+    clause = " AND ".join(f"`{c}` = :k{i}" for i, c in enumerate(key))
+    return clause, {f"k{i}": v for i, v in enumerate(key.values())}
+
+
+def ApplyPatch(updates, inserts, deletes, DBn, TBLn):
+    """Apply a hand correction to one table, all of it or none of it, in one transaction.
+
+    ``deletes`` is a list of primary-key dicts, ``updates`` a list of ``(key, {column: value})``
+    and ``inserts`` a list of full-row dicts; they run in that order, so a wrong key is fixed by a
+    delete of the old row plus an insert of the new one. Column names are backtick-quoted
+    (``Low-High``). Unlike ``_insert_rows`` nothing is retried row by row: any error raises and
+    rolls the whole patch back, because a half-applied correction is worse than none.
+    Returns ``(deleted, updated, inserted)``.
+    """
+    from sqlalchemy import text
+    logging.info(f'ApplyPatch {DBn}.{TBLn}: {len(deletes)} delete(s), {len(updates)} update(s), '
+                 f'{len(inserts)} insert(s)')
+    deleted = updated = 0
+    with get_DBengine().begin() as conn:
+        for key in deletes:
+            where, params = _where(key)
+            deleted += conn.execute(text(f'DELETE FROM {DBn}.{TBLn} WHERE {where}'),
+                                    params).rowcount
+        for key, values in updates:
+            where, params = _where(key)
+            sets = ", ".join(f"`{c}` = :v{i}" for i, c in enumerate(values))
+            params.update({f"v{i}": v for i, v in enumerate(values.values())})
+            updated += conn.execute(text(f'UPDATE {DBn}.{TBLn} SET {sets} WHERE {where}'),
+                                    params).rowcount
+        if inserts:
+            pd.DataFrame(inserts).to_sql(name=TBLn, con=conn, schema=DBn, if_exists='append',
+                                         index=False)
+    return deleted, updated, len(inserts)

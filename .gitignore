@@ -1,6 +1,12 @@
 temp/
 DB_Config.env
 test/
+.venv*/
+.claude/
+*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.csv
+*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.applied.json
+*Top20*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.pdf
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -80,7 +86,7 @@ docs/_build/
 target/
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
 
 # IPython
 profile_default/
